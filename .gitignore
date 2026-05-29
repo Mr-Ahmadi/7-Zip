@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+SevenZipSwift/.build/
+*.app
+*.dSYM
+
+# macOS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+*.xcuserdata/
+*.xcworkspace/
+project.xcworkspace/
+xcuserdata/
+
+# XcodeGen generated
+SevenZipSwift/SevenZip.xcodeproj/
+
+# Dependencies
+*.framework/
+
+# Logs
+*.log

@@ -1,0 +1,55 @@
+name: SevenZip
+options:
+  bundleIdPrefix: com.sevenzip
+  deploymentTarget:
+    macOS: "14.0"
+    iOS: "17.0"
+  xcodeVersion: "15.0"
+
+settings:
+  SWIFT_VERSION: "5.9"
+  MARKETING_VERSION: "1.0.0"
+  CURRENT_PROJECT_VERSION: "1"
+  CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+  CLANG_CXX_LIBRARY: "libc++"
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
+  IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+
+targets:
+  SevenZipMac:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/SevenZipApp
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.sevenzip.macos
+      PRODUCT_NAME: "7-Zip"
+      INFOPLIST_FILE: macOS/Info.plist
+      ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+      ENABLE_HARDENED_RUNTIME: "YES"
+      COMBINE_HIDPI_IMAGES: "YES"
+      SWIFT_OBJC_INTERFACE_HEADER_NAME: "SevenZipApp-Swift.h"
+      SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/Sources/SevenZipApp/Support/BridgingHeader.h"
+      HEADER_SEARCH_PATHS:
+        - "$(SRCROOT)/Sources/SevenZipApp/Bridge"
+    info:
+      path: macOS/Info.plist
+
+  SevenZipiOS:
+    type: application
+    platform: iOS
+    sources:
+      - Sources/SevenZipApp
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.sevenzip.ios
+      PRODUCT_NAME: "7-Zip"
+      INFOPLIST_FILE: iOS/Info.plist
+      ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      TARGETED_DEVICE_FAMILY: "1,2"
+      SWIFT_OBJC_INTERFACE_HEADER_NAME: "SevenZipApp-Swift.h"
+      SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/Sources/SevenZipApp/Support/BridgingHeader.h"
+      HEADER_SEARCH_PATHS:
+        - "$(SRCROOT)/Sources/SevenZipApp/Bridge"
+    info:
+      path: iOS/Info.plist

@@ -1,0 +1,6 @@
+// CNcurses - module map for system ncurses
+module CNcurses [system] {
+    header "include/shim.h"
+    link "ncurses"
+    export *
+}
