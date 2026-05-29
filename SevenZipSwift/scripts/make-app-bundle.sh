@@ -3,7 +3,14 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD_DIR="${1:-$PROJECT_DIR/.build/release}"
+
+# If no build dir provided, auto-detect the triple-qualified release path
+if [ -z "${1:-}" ]; then
+    BUILD_DIR=$(find "$PROJECT_DIR/.build" -maxdepth 2 -type d -name "release" 2>/dev/null | head -1)
+    BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/.build/release}"
+else
+    BUILD_DIR="$1"
+fi
 APP_NAME="7-Zip"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 

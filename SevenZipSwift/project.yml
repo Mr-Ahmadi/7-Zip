@@ -4,7 +4,7 @@ options:
   deploymentTarget:
     macOS: "14.0"
     iOS: "17.0"
-  xcodeVersion: "15.0"
+  xcodeVersion: "15.4"
 
 settings:
   SWIFT_VERSION: "5.9"

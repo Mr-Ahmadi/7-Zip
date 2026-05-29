@@ -14,9 +14,22 @@ NC='\033[0m'
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-info()  { echo -e "${GREEN}==>${NC} ${BOLD}$1${NC}"; }
-warn()  { echo -e "${YELLOW}==>${NC} $1"; }
-error() { echo -e "${RED}==>${NC} $1"; }
+info()  { printf "${GREEN}==>${NC} ${BOLD}%s${NC}\n" "$1"; }
+warn()  { printf "${YELLOW}==>${NC} %s\n" "$1"; }
+error() { printf "${RED}==>${NC} %s\n" "$1"; }
+
+# Detect the SPM build output directory (includes target triple)
+detect_build_dir() {
+    local config="${1:-release}"
+    local base="$PROJECT_DIR/.build"
+    # Newer SwiftPM uses .build/<triple>/<config>/
+    local dir
+    dir=$(find "$base" -maxdepth 2 -type d -name "$config" 2>/dev/null | head -1)
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+        dir="$base/$config"
+    fi
+    echo "$dir"
+}
 
 # ── Prerequisites ───────────────────────────────────────────────────
 
@@ -26,10 +39,13 @@ check_prereqs() {
         echo "  xcode-select --install"
         exit 1
     fi
-    local ver=$(swift --version | head -1 | grep -oE 'version [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' || echo "0")
-    local maj=${ver%.*}
-    local min=${ver#*.}
-    if [ "$maj" -lt 5 ] || { [ "$maj" -eq 5 ] && [ "$min" -lt 9 ]; }; then
+    local ver
+    ver="$(swift --version | grep -oE 'version [0-9]+\.[0-9]+' | tail -1 | grep -oE '[0-9]+\.[0-9]+')"
+    if [ -z "$ver" ]; then
+        error "Could not determine Swift version."
+        exit 1
+    fi
+    if ! echo "$ver" | awk -F. '{ exit !($1 > 5 || ($1 == 5 && $2 >= 9)) }'; then
         error "Swift 5.9+ required (found $ver). Update Xcode."
         exit 1
     fi
@@ -49,11 +65,13 @@ check_prereqs() {
 
 install_cli() {
     info "Building 7z CLI (release)..."
-    swift build --product 7z --configuration release
+    swift build --product 7z -c release
 
+    local build_dir
+    build_dir="$(detect_build_dir "release")"
     info "Installing 7z to /usr/local/bin/..."
     mkdir -p /usr/local/bin
-    cp -f "$PROJECT_DIR/.build/release/7z" /usr/local/bin/7z
+    cp -f "$build_dir/7z" /usr/local/bin/7z
     chmod +x /usr/local/bin/7z
     echo "  ✓ /usr/local/bin/7z"
 }
@@ -62,19 +80,20 @@ install_cli() {
 
 install_gui() {
     info "Building 7-Zip GUI (release)..."
-    swift build --product "7-Zip" --configuration release
+    swift build --product "7-Zip" -c release
 
+    local build_dir
+    build_dir="$(detect_build_dir "release")"
     info "Creating 7-Zip.app bundle..."
-    bash "$PROJECT_DIR/scripts/make-app-bundle.sh"
+    bash "$PROJECT_DIR/scripts/make-app-bundle.sh" "$build_dir"
 
     info "Installing 7-Zip.app to /Applications/..."
-    local app_src="$PROJECT_DIR/.build/release/7-Zip.app"
+    local app_src="$build_dir/7-Zip.app"
     if [ -d "$app_src" ]; then
         rm -rf /Applications/7-Zip.app 2>/dev/null || true
         cp -Rf "$app_src" /Applications/7-Zip.app
         echo "  ✓ /Applications/7-Zip.app"
 
-        # Register with Launch Services so Finder picks up the icon
         /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
             -f /Applications/7-Zip.app 2>/dev/null || true
     else
@@ -87,8 +106,12 @@ install_gui() {
 uninstall() {
     info "Removing 7-Zip..."
     local n=0
-    [ -f /usr/local/bin/7z ] && rm -f /usr/local/bin/7z && echo "  ✓ /usr/local/bin/7z" && n=1
-    [ -d /Applications/7-Zip.app ] && rm -rf /Applications/7-Zip.app && echo "  ✓ /Applications/7-Zip.app" && n=1
+    if [ -f /usr/local/bin/7z ]; then
+        rm -f /usr/local/bin/7z && echo "  ✓ /usr/local/bin/7z" && n=$((n + 1))
+    fi
+    if [ -d /Applications/7-Zip.app ]; then
+        rm -rf /Applications/7-Zip.app && echo "  ✓ /Applications/7-Zip.app" && n=$((n + 1))
+    fi
     [ "$n" -eq 0 ] && echo "  Nothing to remove."
 }
 
@@ -126,7 +149,7 @@ case "${1:-install}" in
         ;;
     uninstall)
         if [ "$(id -u)" -ne 0 ]; then
-            exec sudo "$0" uninstall "$@"
+            exec sudo "$0" uninstall
         fi
         uninstall
         ;;
