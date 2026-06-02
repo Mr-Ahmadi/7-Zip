@@ -8,6 +8,8 @@
 #include <iomanip>
 #include <regex>
 #include <cstring>
+#include <cstdlib>
+#include <unordered_map>
 
 #if defined(__APPLE__)
 #include <sys/types.h>
@@ -17,6 +19,7 @@
 #include <fcntl.h>
 #include <chrono>
 #include <thread>
+#include <mach-o/dyld.h>
 #endif
 
 // ══════════════════════════════════════════════════════════════════════
@@ -39,7 +42,7 @@ struct ArchiverCore {
     int processId = -1;
     bool cancelled = false;
 
-    std::vector<InternalEntry> listArchive(const std::string &archivePath, std::string &error);
+    std::vector<InternalEntry> listArchive(const std::string &archivePath, const std::string &password, std::string &error);
     bool extractArchive(const std::string &archivePath, const std::string &destination,
                         const std::string &password, std::string &error,
                         CProgressCallback progress, void *context);
@@ -56,7 +59,16 @@ struct ArchiverCore {
 private:
     bool executeTool(const std::string &prog, const std::vector<std::string> &args,
                      std::string &output, std::string &error,
-                     CProgressCallback progressCallback, void *context);
+                     CProgressCallback progressCallback, void *context,
+                     const std::string *inputData = nullptr);
+    bool createCompoundArchive(const std::vector<std::string> &files,
+                               const std::string &destination,
+                               const std::string &innerFormat,
+                               const std::string &compressionFormat,
+                               int compressionLevel,
+                               const std::string &password,
+                               std::string &error,
+                               CProgressCallback progress, void *context);
     std::vector<InternalEntry> parseOutput(const std::string &data);
 };
 
@@ -77,10 +89,11 @@ void archiver_cancel(void *handle) {
 
 // ── List ───────────────────────────────────────────────────────────────
 
-CArchiveEntryList *archiver_list(void *handle, const char *path, char **error) {
+CArchiveEntryList *archiver_list(void *handle, const char *path, const char *password, char **error) {
     auto *arch = static_cast<ArchiverCore *>(handle);
+    std::string pwd = password ?: "";
     std::string err;
-    auto entries = arch->listArchive(path ?: "", err);
+    auto entries = arch->listArchive(path ?: "", pwd, err);
     if (!err.empty()) {
         if (error) *error = strdup(err.c_str());
         auto *list = new CArchiveEntryList{nullptr, 0};
@@ -169,14 +182,16 @@ char *archiver_find_tool(void) {
 // ArchiverCore Implementation
 // ══════════════════════════════════════════════════════════════════════
 
-std::vector<InternalEntry> ArchiverCore::listArchive(const std::string &archivePath, std::string &error) {
+std::vector<InternalEntry> ArchiverCore::listArchive(const std::string &archivePath, const std::string &password, std::string &error) {
     action = CAction::List;
     cancelled = false;
     std::string output;
     std::string err;
     std::string tool = findTool();
-    if (tool.empty()) { error = "7za not found. Install p7zip."; return {}; }
-    if (!executeTool(tool, {"l", "-ba", archivePath}, output, err, nullptr, nullptr)) {
+    if (tool.empty()) { error = "Archive engine not found."; return {}; }
+    std::vector<std::string> args = {"l", "-ba", archivePath};
+    if (!password.empty()) args.push_back("-p" + password);
+    if (!executeTool(tool, args, output, err, nullptr, nullptr)) {
         error = err.empty() ? "Failed to list archive" : err;
         return {};
     }
@@ -204,6 +219,22 @@ bool ArchiverCore::createArchive(const std::vector<std::string> &files, const st
     cancelled = false;
     std::string tool = findTool();
     if (tool.empty()) { error = "No archive tool found."; return false; }
+
+    // Compound formats (tar.gz, tar.bz2, tar.xz) need two-step creation
+    static const std::vector<std::string> compoundFormats = {"tar.gz", "tar.bz2", "tar.xz"};
+    if (std::find(compoundFormats.begin(), compoundFormats.end(), format) != compoundFormats.end()) {
+        std::string ext = format.substr(format.find('.') + 1);
+        // Map extension to 7za format name: gz→gzip, bz2→bzip2, xz→xz
+        static const std::unordered_map<std::string, std::string> fmtMap = {
+            {"gz", "gzip"}, {"bz2", "bzip2"}, {"xz", "xz"}
+        };
+        auto it = fmtMap.find(ext);
+        if (it == fmtMap.end()) { error = "Unknown compression format: " + ext; return false; }
+        return createCompoundArchive(files, destination, "tar", it->second,
+                                      compressionLevel, password, error,
+                                      progressCallback, context);
+    }
+
     std::vector<std::string> args = {"a", "-t" + format, destination,
                                      "-mx=" + std::to_string(compressionLevel), "-y"};
     if (!password.empty()) {
@@ -257,6 +288,30 @@ bool ArchiverCore::isArchive(const std::string &path) {
 std::string ArchiverCore::findTool() {
 #if defined(__APPLE__)
     auto exists = [](const std::string &p) -> bool { return access(p.c_str(), X_OK) == 0; };
+
+    // 1. Check app bundle's Resources/bin/7za (embedded in .app bundle)
+    char exeBuf[PATH_MAX];
+    uint32_t exeSize = sizeof(exeBuf);
+    if (_NSGetExecutablePath(exeBuf, &exeSize) == 0) {
+        std::string exePath(exeBuf);
+        auto slash = exePath.rfind('/');
+        if (slash != std::string::npos) {
+            std::string exeDir = exePath.substr(0, slash);
+            // In a proper .app bundle: App.app/Contents/MacOS/ -> ../Resources/bin/7za
+            std::string bundled = exeDir + "/../Resources/bin/7za";
+            char *resolved = realpath(bundled.c_str(), nullptr);
+            if (resolved) {
+                std::string resolvedStr(resolved);
+                ::free(resolved);
+                if (exists(resolvedStr)) return resolvedStr;
+            }
+            // Sidecar: executable-relative bin/7za
+            std::string sidecar = exeDir + "/bin/7za";
+            if (exists(sidecar)) return sidecar;
+        }
+    }
+
+    // 2. Check well-known system paths
     std::vector<std::string> candidates = {
         "/opt/homebrew/bin/7z", "/usr/local/bin/7z", "/usr/bin/7z",
         "/opt/homebrew/bin/7za", "/usr/local/bin/7za",
@@ -265,6 +320,8 @@ std::string ArchiverCore::findTool() {
     for (const auto &p : candidates) {
         if (exists(p)) return p;
     }
+
+    // 3. Scan PATH
     const char *pathEnv = getenv("PATH");
     if (pathEnv) {
         std::string pathStr(pathEnv);
@@ -285,18 +342,69 @@ bool ArchiverCore::isToolAvailable() {
     return !findTool().empty();
 }
 
+bool ArchiverCore::createCompoundArchive(const std::vector<std::string> &files,
+                                          const std::string &destination,
+                                          const std::string &innerFormat,
+                                          const std::string &compressionFormat,
+                                          int compressionLevel,
+                                          const std::string &password,
+                                          std::string &error,
+                                          CProgressCallback progress, void *context) {
+    // Step 1: Create inner archive (tar) to a temp file
+    std::string tool = findTool();
+    char tempPath[] = "/tmp/7z-tar-XXXXXX";
+    int fd = mkstemp(tempPath);
+    if (fd < 0) { error = "Failed to create temp file"; return false; }
+    close(fd);
+
+    std::vector<std::string> innerArgs = {"a", "-t" + innerFormat, tempPath,
+                                           "-mx=" + std::to_string(compressionLevel), "-y"};
+    for (const auto &f : files) innerArgs.push_back(f);
+
+    std::string innerOutput;
+    std::string innerErr;
+    bool innerOk = executeTool(tool, innerArgs, innerOutput, innerErr, nullptr, nullptr);
+    if (!innerOk) {
+        error = innerErr.empty() ? "Failed to create intermediate archive" : innerErr;
+        unlink(tempPath);
+        return false;
+    }
+
+    if (cancelled) { unlink(tempPath); error = "Cancelled"; return false; }
+
+    // Step 2: Compress the temp tar into the final archive
+    std::vector<std::string> compressArgs = {"a", "-t" + compressionFormat, destination, tempPath,
+                                              "-mx=" + std::to_string(compressionLevel), "-y"};
+    if (!password.empty()) {
+        compressArgs.push_back("-p" + password);
+    }
+
+    std::string compressOutput;
+    bool ok = executeTool(tool, compressArgs, compressOutput, error, progress, context);
+    unlink(tempPath);
+    return ok;
+}
+
 bool ArchiverCore::executeTool(const std::string &prog, const std::vector<std::string> &args,
                                 std::string &output, std::string &error,
-                                CProgressCallback progressCallback, void *context) {
+                                CProgressCallback progressCallback, void *context,
+                                const std::string *inputData) {
 #if defined(__APPLE__)
     std::vector<const char *> argv;
     argv.push_back(prog.c_str());
     for (const auto &a : args) argv.push_back(a.c_str());
     argv.push_back(nullptr);
 
+    int stdin_pipe[2] = {-1, -1};
     int stdout_pipe[2], stderr_pipe[2];
     if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
         error = "Failed to create pipes";
+        return false;
+    }
+    if (inputData && pipe(stdin_pipe) < 0) {
+        close(stdout_pipe[0]); close(stdout_pipe[1]);
+        close(stderr_pipe[0]); close(stderr_pipe[1]);
+        error = "Failed to create stdin pipe";
         return false;
     }
 
@@ -304,12 +412,14 @@ bool ArchiverCore::executeTool(const std::string &prog, const std::vector<std::s
     if (pid < 0) {
         close(stdout_pipe[0]); close(stdout_pipe[1]);
         close(stderr_pipe[0]); close(stderr_pipe[1]);
+        if (stdin_pipe[0] >= 0) { close(stdin_pipe[0]); close(stdin_pipe[1]); }
         error = "Failed to fork process";
         return false;
     }
 
     if (pid == 0) {
         close(stdout_pipe[0]); close(stderr_pipe[0]);
+        if (stdin_pipe[1] >= 0) { close(stdin_pipe[1]); dup2(stdin_pipe[0], STDIN_FILENO); close(stdin_pipe[0]); }
         dup2(stdout_pipe[1], STDOUT_FILENO);
         dup2(stderr_pipe[1], STDERR_FILENO);
         close(stdout_pipe[1]); close(stderr_pipe[1]);
@@ -319,6 +429,20 @@ bool ArchiverCore::executeTool(const std::string &prog, const std::vector<std::s
 
     processId = pid;
     close(stdout_pipe[1]); close(stderr_pipe[1]);
+    if (stdin_pipe[0] >= 0) close(stdin_pipe[0]);
+
+    // Write input data to child's stdin if provided
+    if (inputData && stdin_pipe[1] >= 0) {
+        const char *data = inputData->data();
+        size_t remaining = inputData->size();
+        while (remaining > 0) {
+            ssize_t written = write(stdin_pipe[1], data, remaining);
+            if (written < 0) break;
+            data += written;
+            remaining -= written;
+        }
+        close(stdin_pipe[1]);
+    }
 
     std::string stdOut, stdErr;
     char buf[4096];

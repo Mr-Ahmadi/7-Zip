@@ -50,14 +50,12 @@ check_prereqs() {
         exit 1
     fi
 
-    # Check for archiving backend
-    if command -v 7za &>/dev/null; then
-        info "Archive tool: 7za ($(command -v 7za))"
-    elif command -v 7z &>/dev/null; then
-        info "Archive tool: 7z ($(command -v 7z))"
+    # Verify bundled archive tool exists
+    if [ -f "$PROJECT_DIR/../resources/bin/7za" ]; then
+        info "Archive tool: bundled 7za ($($PROJECT_DIR/../resources/bin/7za --help 2>&1 | head -1))"
     else
-        warn "No 7z/7za found on PATH. Install p7zip for archiving:"
-        echo "  brew install p7zip"
+        warn "Bundled 7za binary not found at resources/bin/7za"
+        warn "Compression will use system p7zip if available, or fail."
     fi
 }
 

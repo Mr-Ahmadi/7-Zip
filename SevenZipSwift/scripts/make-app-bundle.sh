@@ -28,6 +28,14 @@ if [ -f "$PROJECT_DIR/Resources/AppIcon.icns" ]; then
     cp "$PROJECT_DIR/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 fi
 
+# Copy bundled 7za binary (embedded — no external p7zip needed)
+if [ -f "$PROJECT_DIR/../resources/bin/7za" ]; then
+    mkdir -p "$APP_BUNDLE/Contents/Resources/bin"
+    cp "$PROJECT_DIR/../resources/bin/7za" "$APP_BUNDLE/Contents/Resources/bin/7za"
+    chmod +x "$APP_BUNDLE/Contents/Resources/bin/7za"
+    echo "  ✓ Embedded 7za ($(file "$APP_BUNDLE/Contents/Resources/bin/7za" | awk -F: '{print $2}'))"
+fi
+
 # Generate Info.plist
 cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

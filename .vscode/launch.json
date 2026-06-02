@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:7-Zip}/SevenZipSwift",
+            "name": "Debug 7-Zip (SevenZipSwift)",
+            "target": "7-Zip",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug 7-Zip (SevenZipSwift)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:7-Zip}/SevenZipSwift",
+            "name": "Release 7-Zip (SevenZipSwift)",
+            "target": "7-Zip",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release 7-Zip (SevenZipSwift)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:7-Zip}/SevenZipSwift",
+            "name": "Debug 7z (SevenZipSwift)",
+            "target": "7z",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug 7z (SevenZipSwift)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:7-Zip}/SevenZipSwift",
+            "name": "Release 7z (SevenZipSwift)",
+            "target": "7z",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release 7z (SevenZipSwift)"
+        }
+    ]
+}

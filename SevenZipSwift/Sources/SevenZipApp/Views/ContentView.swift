@@ -3,7 +3,9 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject var service: ArchiveService
     @State private var showDropTarget = false
-    @State private var isLoading = false
+    @State private var password = ""
+    @State private var passwordError: String?
+    @State private var showPasswordPrompt = false
 
     var body: some View {
         ZStack {
@@ -33,8 +35,22 @@ struct ContentView: View {
         .onAppear {
             openPending()
         }
-        .onChange(of: service.pendingPath) { _ in
+        .onChange(of: service.pendingPath) {
             openPending()
+        }
+        .onChange(of: service.requiresPassword) {
+            if service.requiresPassword {
+                password = ""
+                passwordError = nil
+                showPasswordPrompt = true
+            }
+        }
+        .sheet(isPresented: $showPasswordPrompt, onDismiss: {
+            if service.requiresPassword {
+                service.cancelPasswordPrompt()
+            }
+        }) {
+            passwordPromptView
         }
     }
 
@@ -43,6 +59,61 @@ struct ContentView: View {
         service.pendingPath = nil
         Task { try? await service.openArchive(at: path) }
     }
+
+    // MARK: - Password Prompt
+
+    private var passwordPromptView: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 32))
+                .foregroundStyle(.tint)
+
+            Text("Encrypted Archive")
+                .font(.headline)
+
+            if passwordError != nil {
+                Text("Wrong password. Try again.")
+                    .font(.subheadline)
+                    .foregroundStyle(.red)
+            } else {
+                Text("This archive is password-protected.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            SecureField("Password", text: $password)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 220)
+                .onChange(of: password) { passwordError = nil }
+
+            HStack(spacing: 12) {
+                Button("Cancel") {
+                    service.cancelPasswordPrompt()
+                    showPasswordPrompt = false
+                }
+                .keyboardShortcut(.escape)
+
+                Button("Open") {
+                    let pwd = password
+                    Task {
+                        if let err = await service.retryWithPassword(pwd) {
+                            passwordError = err
+                            password = ""
+                        } else {
+                            showPasswordPrompt = false
+                        }
+                    }
+                }
+                .keyboardShortcut(.return)
+                .disabled(password.isEmpty)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(24)
+        .frame(width: 300)
+    }
+
+    // MARK: - Loading
 
     private var loadingOverlay: some View {
         ZStack {
@@ -54,6 +125,8 @@ struct ContentView: View {
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         }
     }
+
+    // MARK: - Drop
 
     private var dropOverlay: some View {
         ZStack {

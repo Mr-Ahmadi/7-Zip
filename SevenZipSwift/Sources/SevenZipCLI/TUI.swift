@@ -128,9 +128,11 @@ final class TUIApp {
         }
 
         var err: UnsafeMutablePointer<CChar>?
-        guard let list = archiver_list(archiver, path, &err) else {
-            let msg = err.map { String(cString: $0) } ?? "Unknown error"
-            err.map { archiver_free_string($0) }
+        guard let list = archiver_list(archiver, path, nil, &err) else { return }
+        if let e = err {
+            let msg = String(cString: e)
+            archiver_free_string(e)
+            archiver_free_entries(list)
             statusMessage = "Failed to list archive: \(msg)"
             return
         }

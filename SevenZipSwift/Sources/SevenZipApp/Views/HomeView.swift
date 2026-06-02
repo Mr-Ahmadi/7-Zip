@@ -84,7 +84,7 @@ struct HomeView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
-                    Text("7za not found. Install p7zip: brew install p7zip")
+                    Text("Archive engine not available")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

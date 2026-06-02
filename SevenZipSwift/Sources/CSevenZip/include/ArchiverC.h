@@ -33,7 +33,7 @@ void archiver_cancel(void *handle);
 
 // ── Operations (caller must free results) ─────────────────────────────
 
-CArchiveEntryList *archiver_list(void *handle, const char *path, char **error);
+CArchiveEntryList *archiver_list(void *handle, const char *path, const char *password, char **error);
 bool archiver_extract(void *handle, const char *path, const char *dest,
                       const char *password, char **error,
                       CProgressCallback progress, void *context);

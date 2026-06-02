@@ -156,8 +156,12 @@ func cmdList(args: Args) {
     let handle = archiver_create()
     defer { archiver_destroy(handle) }
     var err: UnsafeMutablePointer<CChar>?
-    guard let list = archiver_list(handle, path, &err) else {
-        if let e = err { printStderr("error: \(String(cString: e))"); archiver_free_string(e) }
+    guard let list = archiver_list(handle, path, args.password.isEmpty ? nil : args.password, &err)
+    else { exit(1) }
+    if let e = err {
+        printStderr("error: \(String(cString: e))")
+        archiver_free_string(e)
+        archiver_free_entries(list)
         exit(1)
     }
     defer { archiver_free_entries(list) }
