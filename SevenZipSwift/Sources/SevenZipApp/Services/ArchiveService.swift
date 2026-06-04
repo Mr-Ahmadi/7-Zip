@@ -290,6 +290,11 @@ final class ArchiveService: ObservableObject {
         saveRecents()
     }
 
+    func clearRecents() {
+        recentArchives.removeAll()
+        saveRecents()
+    }
+
     private func loadRecents() {
         recentArchives = UserDefaults.standard.stringArray(forKey: recentsKey) ?? []
         recentArchives.removeAll { !FileManager.default.fileExists(atPath: $0) }

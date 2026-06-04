@@ -75,6 +75,16 @@ struct HomeView: View {
                         .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 6))
                         .frame(maxWidth: 320)
                     }
+
+                    Button {
+                        service.clearRecents()
+                    } label: {
+                        Text("Clear")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 4)
                 }
             }
 

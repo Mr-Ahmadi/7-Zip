@@ -1,5 +1,7 @@
 # 7-Zip for macOS
 
+![Screenshot](Screenshot.png)
+
 A native macOS archive manager with both **GUI** and **CLI** interfaces.
 
 ## Features

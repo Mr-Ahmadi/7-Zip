@@ -58,6 +58,7 @@ private:
     void refreshInfo();
 
     void addRecent(const QString &path);
+    void clearRecents();
     void rebuildRecentWidget();
     void saveRecents();
     void loadRecents();
@@ -83,6 +84,7 @@ private:
     QAction *m_extractAct = nullptr;
     QAction *m_extractHereAct = nullptr;
     QAction *m_closeAct = nullptr;
+    QAction *m_clearRecentAct = nullptr;
 
     // Services
     ArchiveService *m_svc = nullptr;

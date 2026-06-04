@@ -234,6 +234,17 @@ void MainWindow::buildEmptyPage()
     lay->addSpacing(12);
     lay->addWidget(recentTitle, 0, Qt::AlignCenter);
     lay->addWidget(m_recentsList, 0, Qt::AlignCenter);
+
+    auto *clearBtn = new QPushButton("Clear");
+    clearBtn->setObjectName("clearRecentsBtn");
+    clearBtn->setFlat(true);
+    clearBtn->setCursor(Qt::PointingHandCursor);
+    clearBtn->setStyleSheet("QPushButton { color: rgba(128,128,128,0.5); font-size: 10px; font-weight: 600; }"
+                            "QPushButton:hover { color: palette(highlight); }");
+    clearBtn->setVisible(!m_recents.isEmpty());
+    connect(clearBtn, &QPushButton::clicked, this, &MainWindow::clearRecents);
+    lay->addWidget(clearBtn, 0, Qt::AlignCenter);
+
     lay->addWidget(dropHint, 0, Qt::AlignCenter);
     lay->addStretch(4);
 
@@ -340,6 +351,11 @@ void MainWindow::buildMenu()
     m_closeAct->setShortcut(QKeySequence("Ctrl+W"));
     m_closeAct->setEnabled(false);
     connect(m_closeAct, &QAction::triggered, this, &MainWindow::closeArchive);
+
+    file->addSeparator();
+    m_clearRecentAct = file->addAction("Clear &Recently Opened");
+    m_clearRecentAct->setEnabled(!m_recents.isEmpty());
+    connect(m_clearRecentAct, &QAction::triggered, this, &MainWindow::clearRecents);
 
     file->addSeparator();
     auto *quit = file->addAction("&Quit");
@@ -451,6 +467,14 @@ void MainWindow::addRecent(const QString &path)
     rebuildRecentWidget();
 }
 
+void MainWindow::clearRecents()
+{
+    m_recents.clear();
+    saveRecents();
+    rebuildRecentWidget();
+    if (m_clearRecentAct) m_clearRecentAct->setEnabled(false);
+}
+
 void MainWindow::rebuildRecentWidget()
 {
     auto *rl = qobject_cast<QVBoxLayout *>(m_recentsList->layout());
@@ -466,6 +490,9 @@ void MainWindow::rebuildRecentWidget()
         connect(btn, &QPushButton::clicked, this, [this, r]() { loadArchive(r); });
         rl->addWidget(btn);
     }
+    if (m_clearRecentAct) m_clearRecentAct->setEnabled(!m_recents.isEmpty());
+    auto *clearBtn = m_emptyPage->findChild<QPushButton *>("clearRecentsBtn");
+    if (clearBtn) clearBtn->setVisible(!m_recents.isEmpty());
 }
 
 void MainWindow::saveRecents()
