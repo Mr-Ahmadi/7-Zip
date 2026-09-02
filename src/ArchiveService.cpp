@@ -72,6 +72,19 @@ QString ArchiveService::bundledTool()
 
 bool ArchiveService::isBundledAvailable() { return !bundledTool().isEmpty(); }
 
+/// The Unarchiver's `unar`, used as a last-resort extractor: no 7-Zip build
+/// decodes RAR compression version 6 (WinRAR 7.0+), which lists fine but fails
+/// on every entry.
+static QString findUnar()
+{
+    for (const QString &p : {QStringLiteral("/opt/homebrew/bin/unar"),
+                             QStringLiteral("/usr/local/bin/unar"),
+                             QStringLiteral("/usr/bin/unar")}) {
+        if (QFileInfo::exists(p)) return p;
+    }
+    return QStandardPaths::findExecutable("unar");
+}
+
 /// An engine reporting it cannot read the file may simply lack the codec, so a
 /// fuller engine is worth trying. Password failures are excluded: they are a
 /// real answer, and the UI keys its prompt off that message.
@@ -192,6 +205,9 @@ void ArchiveService::extractArchive(const QString &archivePath, const QString &d
 {
     m_op = Extract;
     m_engineIndex = 0;
+    m_extractDest = destination;
+    m_extractPassword = password;
+    m_triedUnar = false;
     QDir().mkpath(destination);
     QString tool = bundledTool();
     if (tool.isEmpty()) {
@@ -311,6 +327,17 @@ void ArchiveService::onProcessFinished(int exitCode, QProcess::ExitStatus status
                 const QStringList args = m_lastArgs;
                 if (m_proc) { m_proc->deleteLater(); m_proc = nullptr; }
                 QTimer::singleShot(0, this, [this, next, args] { startProc(next, args); });
+                return;
+            }
+            // Every 7-Zip engine is out; unar still handles newer RAR.
+            const QString unar = m_op == Extract && !m_triedUnar ? findUnar() : QString();
+            if (!unar.isEmpty()) {
+                m_triedUnar = true;
+                QStringList args{"-q", "-f", "-D", "-o", m_extractDest};
+                if (!m_extractPassword.isEmpty()) args << "-p" << m_extractPassword;
+                args << m_lastArgs.value(1);  // the archive path
+                if (m_proc) { m_proc->deleteLater(); m_proc = nullptr; }
+                QTimer::singleShot(0, this, [this, unar, args] { startProc(unar, args); });
                 return;
             }
         }

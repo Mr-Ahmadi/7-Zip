@@ -342,17 +342,46 @@ std::string baseName(const std::string &path) {
 std::string unsupportedFormatError(const std::string &path) {
     return "Cannot open " + baseName(path) + ": no available archive engine "
            "supports this format.\nThe bundled engine handles 7z, zip, tar, gzip, "
-           "bzip2, xz and zstd. RAR, ISO, DMG, WIM and similar formats need a "
-           "fuller engine:\n  brew install sevenzip";
+           "bzip2, xz and zstd. Other formats need a fuller engine:\n"
+           "  brew install sevenzip   (ISO, DMG, WIM, CAB, older RAR)\n"
+           "  brew install unar       (newer RAR)";
 }
 
-/// Message shown when an engine reads the archive but cannot decode it — the
-/// case for RAR5 archives written with a method p7zip 17.x does not implement.
+/// Message shown when an engine reads the archive but cannot decode it.
+/// RAR compression version 6 (WinRAR 7.0+) is the common case: no 7-Zip build
+/// decodes it, so `unar` is what to install — not a newer 7-Zip.
 std::string undecodableError(const std::string &path) {
-    return baseName(path) + " uses a compression method that no available "
-           "archive engine can decode, so no data could be recovered.\n"
-           "This is common for newer RAR archives. Installing the official "
-           "7-Zip usually fixes it:\n  brew install sevenzip";
+    return baseName(path) + " uses a compression method no installed tool can "
+           "decode.\nNewer RAR archives (compression version 6) need The "
+           "Unarchiver:\n  brew install unar";
+}
+
+/// Locate The Unarchiver's `unar`, used as a last-resort extractor.
+///
+/// 7-Zip cannot decode RAR compression version 6 (written by WinRAR 7.0 and
+/// later) at any version — it reads the headers, so listing works, but every
+/// entry fails to decode. `unar` handles those archives.
+std::string findUnar() {
+#if defined(__APPLE__)
+    auto usable = [](const std::string &p) { return access(p.c_str(), X_OK) == 0; };
+    static const char *candidates[] = {
+        "/opt/homebrew/bin/unar", "/usr/local/bin/unar", "/usr/bin/unar"
+    };
+    for (const char *c : candidates) {
+        if (usable(c)) return c;
+    }
+    const char *pathEnv = getenv("PATH");
+    if (pathEnv) {
+        std::istringstream ss(std::string{pathEnv});
+        std::string dir;
+        while (std::getline(ss, dir, ':')) {
+            if (dir.empty()) continue;
+            std::string c = dir + "/unar";
+            if (usable(c)) return c;
+        }
+    }
+#endif
+    return "";
 }
 
 std::string tempDirRoot() {
@@ -424,6 +453,25 @@ bool ArchiverCore::extractArchive(const std::string &archivePath, const std::str
         if (looksUndecodable(err)) sawUndecodable = true;
         if (!looksUnsupported(err)) { allUnsupported = false; break; }
         if (cancelled) { allUnsupported = false; break; }
+    }
+
+    // Last resort: no 7-Zip build decodes RAR compression version 6, so hand
+    // the archive to unar. It writes the same layout (-D keeps the archive's
+    // own top-level entries directly under the destination, as 7-Zip does).
+    if (allUnsupported || sawUndecodable) {
+        std::string unar = findUnar();
+        if (!unar.empty() && !cancelled) {
+            std::vector<std::string> unarArgs = {"-q", "-f", "-D", "-o", destination};
+            if (!password.empty()) { unarArgs.push_back("-p"); unarArgs.push_back(password); }
+            unarArgs.push_back(archivePath);
+
+            std::string unarOut;
+            std::string unarErr;
+            if (executeTool(unar, unarArgs, unarOut, unarErr, progressCallback, context)) {
+                return true;
+            }
+            if (!unarErr.empty()) lastErr = unarErr;
+        }
     }
 
     // A failed decode still leaves the empty placeholder files the engine

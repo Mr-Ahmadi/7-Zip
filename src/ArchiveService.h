@@ -66,6 +66,9 @@ private:
     QString m_compoundFinal;
     QStringList m_lastArgs;     // replayed when falling back to another engine
     int m_engineIndex = 0;
+    QString m_extractDest;      // replayed when falling back to unar
+    QString m_extractPassword;
+    bool m_triedUnar = false;
 
     void startProc(const QString &prog, const QStringList &args);
     QVector<ArchiveEntry> parse7zList(const QString &data);

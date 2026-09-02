@@ -33,18 +33,23 @@ Run `7z --tool` to print the engine actually in use, and set `SEVENZIP_DEBUG=1`
 to trace every engine invocation on stderr.
 
 The bundled `7za` is p7zip's *reduced* build: it handles 7z, zip, tar, gzip,
-bzip2, xz, Z and zstd, but has **no RAR, ISO, DMG, WIM or CAB codecs**. When it
-cannot read a file, the app automatically retries with a fuller system engine,
-so install one for those formats:
+bzip2, xz, Z and zstd, but has **no RAR, ISO, DMG, WIM or CAB codecs**. When an
+engine cannot read a file, the app automatically retries the next one, so
+install these for wider format support:
 
 ```bash
-brew install sevenzip   # provides 7zz — the official 7-Zip, widest format support
-brew install p7zip      # provides 7z — older, no RAR5 support past ~2023
+brew install sevenzip   # 7zz — official 7-Zip: ISO, DMG, WIM, CAB, older RAR
+brew install unar       # unar — The Unarchiver: newer RAR (see below)
 ```
 
+**Newer RAR archives need `unar`, not a newer 7-Zip.** WinRAR 7.0 introduced
+compression version 6 (`Method = v6:…`), which *no* 7-Zip build decodes — not
+even 26.x. 7-Zip still reads the headers, so such an archive lists correctly
+and then fails on extraction with `Unsupported Method` for every entry, leaving
+a zero-byte file behind for each. The app detects this and hands the archive to
+`unar`, which extracts it correctly.
+
 Without a capable engine you get a clear error rather than an empty window.
-Note that p7zip 17.x cannot decode RAR archives written by recent versions of
-WinRAR; `sevenzip` (7zz) is the one to install for those.
 
 ### Build & Install (SwiftUI App)
 
@@ -132,8 +137,9 @@ make
 | ------ | :----: | :-----: |
 | 7z, zip, tar | ✓ | ✓ |
 | tar.gz, tar.bz2, tar.xz | ✓ | ✓ |
-| rar | — | ✓ (needs a system engine) |
-| iso, cab, dmg, wim, arj, lzh, … | — | ✓ (needs a system engine) |
+| rar (older) | — | ✓ (needs `sevenzip`) |
+| rar (WinRAR 7+, `v6`) | — | ✓ (needs `unar`) |
+| iso, cab, dmg, wim, arj, lzh, … | — | ✓ (needs `sevenzip`) |
 
 Compound formats (`tar.gz`, `tar.bz2`, `tar.xz`) are built in two steps: the
 files go into a tar named after the final archive, which is then compressed.
