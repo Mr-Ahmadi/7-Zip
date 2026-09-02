@@ -34,6 +34,7 @@ public:
     void cancel();
 
     static QString bundledTool();
+    static QStringList engineCandidates();
     static bool isBundledAvailable();
     static QString formatSize(qint64 bytes);
     static bool isArchive(const QString &path);
@@ -63,6 +64,8 @@ private:
     QStringList m_pendingCompress;
     QString m_compoundStaged;   // partial output, renamed into place on success
     QString m_compoundFinal;
+    QStringList m_lastArgs;     // replayed when falling back to another engine
+    int m_engineIndex = 0;
 
     void startProc(const QString &prog, const QStringList &args);
     QVector<ArchiveEntry> parse7zList(const QString &data);

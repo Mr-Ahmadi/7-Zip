@@ -6,6 +6,7 @@ struct ContentView: View {
     @State private var password = ""
     @State private var passwordError: String?
     @State private var showPasswordPrompt = false
+    @State private var errorMessage: String?
 
     var body: some View {
         ZStack {
@@ -51,6 +52,20 @@ struct ContentView: View {
             }
         }) {
             passwordPromptView
+        }
+        // Failures used to be swallowed, leaving an empty window with no
+        // explanation of what went wrong.
+        .onChange(of: service.action) {
+            if case .failure(let message) = service.action {
+                errorMessage = message
+            }
+        }
+        .alert("Could not open archive",
+               isPresented: Binding(get: { errorMessage != nil },
+                                    set: { if !$0 { errorMessage = nil } })) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "")
         }
     }
 

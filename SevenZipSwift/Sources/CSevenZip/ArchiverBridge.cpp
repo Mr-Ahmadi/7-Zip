@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cerrno>
+#include <mutex>
 #include <unordered_map>
 
 #if defined(__APPLE__)
@@ -55,6 +56,7 @@ struct ArchiverCore {
 
     static bool isArchive(const std::string &path);
     static std::string findTool();
+    static std::vector<std::string> findTools();
     static bool isToolAvailable();
 
 private:
@@ -257,6 +259,102 @@ std::string innerTarName(const std::string &destination) {
     return base;
 }
 
+/// Ask a candidate binary to describe itself. A genuine 7-Zip/p7zip engine
+/// answers `i` with its format table and exits 0.
+bool probeEngine(const std::string &path) {
+#if defined(__APPLE__)
+    int fds[2];
+    if (pipe(fds) < 0) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return false; }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        dup2(fds[1], STDERR_FILENO);
+        close(fds[1]);
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
+        execl(path.c_str(), path.c_str(), "i", static_cast<char *>(nullptr));
+        _exit(127);
+    }
+
+    close(fds[1]);
+    std::string out;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(fds[0], buf, sizeof(buf))) > 0) out.append(buf, n);
+    close(fds[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+           out.find("7-Zip") != std::string::npos;
+#else
+    (void)path;
+    return false;
+#endif
+}
+
+/// Cached form of probeEngine. Guards against picking up a binary that merely
+/// happens to be called `7z` — this project installs its own CLI as
+/// /usr/local/bin/7z, and driving that as an engine would be nonsense.
+bool isUsableEngine(const std::string &path) {
+    static std::mutex mutex;
+    static std::unordered_map<std::string, bool> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = cache.find(path);
+    if (it != cache.end()) return it->second;
+    bool ok = probeEngine(path);
+    cache.emplace(path, ok);
+    return ok;
+}
+
+/// True when the engine could read the archive but not decode its contents,
+/// which means the engine is too old rather than the file being unreadable.
+bool looksUndecodable(const std::string &err) {
+    return toLower(err).find("unsupported method") != std::string::npos;
+}
+
+/// True when an engine reports it simply cannot read the file as an archive —
+/// the signature of a missing codec, which a fuller engine may still handle.
+/// Password failures are deliberately excluded: they are a real answer, and
+/// callers key the password prompt off that message.
+bool looksUnsupported(const std::string &err) {
+    std::string e = toLower(err);
+    if (e.find("password") != std::string::npos ||
+        e.find("encrypted") != std::string::npos) {
+        return false;
+    }
+    return e.find("can not open the file as archive") != std::string::npos ||
+           e.find("cannot open the file as archive") != std::string::npos ||
+           e.find("is not supported archive") != std::string::npos ||
+           e.find("unsupported archive") != std::string::npos ||
+           e.find("unsupported method") != std::string::npos;
+}
+
+std::string baseName(const std::string &path) {
+    auto slash = path.rfind('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+/// Message shown when no installed engine can read the format at all.
+std::string unsupportedFormatError(const std::string &path) {
+    return "Cannot open " + baseName(path) + ": no available archive engine "
+           "supports this format.\nThe bundled engine handles 7z, zip, tar, gzip, "
+           "bzip2, xz and zstd. RAR, ISO, DMG, WIM and similar formats need a "
+           "fuller engine:\n  brew install sevenzip";
+}
+
+/// Message shown when an engine reads the archive but cannot decode it — the
+/// case for RAR5 archives written with a method p7zip 17.x does not implement.
+std::string undecodableError(const std::string &path) {
+    return baseName(path) + " uses a compression method that no available "
+           "archive engine can decode, so no data could be recovered.\n"
+           "This is common for newer RAR archives. Installing the official "
+           "7-Zip usually fixes it:\n  brew install sevenzip";
+}
+
 std::string tempDirRoot() {
     const char *tmp = getenv("TMPDIR");
     std::string root = (tmp && *tmp) ? tmp : "/tmp";
@@ -269,17 +367,37 @@ std::string tempDirRoot() {
 std::vector<InternalEntry> ArchiverCore::listArchive(const std::string &archivePath, const std::string &password, std::string &error) {
     action = CAction::List;
     cancelled = false;
-    std::string output;
-    std::string err;
-    std::string tool = findTool();
-    if (tool.empty()) { error = "Archive engine not found."; return {}; }
+    std::vector<std::string> tools = findTools();
+    if (tools.empty()) { error = "Archive engine not found."; return {}; }
+
     std::vector<std::string> args = {"l", "-ba", archivePath};
     if (!password.empty()) args.push_back("-p" + password);
-    if (!executeTool(tool, args, output, err, nullptr, nullptr)) {
-        error = err.empty() ? "Failed to list archive" : err;
-        return {};
+
+    // The bundled engine is a reduced build; if it cannot read this format,
+    // fall through to a fuller one rather than reporting an empty archive.
+    std::string lastErr;
+    bool allUnsupported = true;
+    bool sawUndecodable = false;
+    for (const auto &tool : tools) {
+        std::string output;
+        std::string err;
+        if (executeTool(tool, args, output, err, nullptr, nullptr)) {
+            return parseOutput(output);
+        }
+        lastErr = err;
+        if (looksUndecodable(err)) sawUndecodable = true;
+        if (!looksUnsupported(err)) { allUnsupported = false; break; }
+        if (cancelled) { allUnsupported = false; break; }
     }
-    return parseOutput(output);
+
+    if (sawUndecodable) {
+        error = undecodableError(archivePath);
+    } else if (allUnsupported) {
+        error = unsupportedFormatError(archivePath);
+    } else {
+        error = lastErr.empty() ? "Failed to list archive" : lastErr;
+    }
+    return {};
 }
 
 bool ArchiverCore::extractArchive(const std::string &archivePath, const std::string &destination,
@@ -287,12 +405,38 @@ bool ArchiverCore::extractArchive(const std::string &archivePath, const std::str
                                    CProgressCallback progressCallback, void *context) {
     action = CAction::Extract;
     cancelled = false;
-    std::string tool = findTool();
-    if (tool.empty()) { error = "No archive tool found."; return false; }
+    std::vector<std::string> tools = findTools();
+    if (tools.empty()) { error = "No archive tool found."; return false; }
+
     std::vector<std::string> args = {"x", archivePath, "-o" + destination, "-y"};
     if (!password.empty()) { args.push_back("-p" + password); }
-    std::string output;
-    return executeTool(tool, args, output, error, progressCallback, context);
+
+    std::string lastErr;
+    bool allUnsupported = true;
+    bool sawUndecodable = false;
+    for (const auto &tool : tools) {
+        std::string output;
+        std::string err;
+        if (executeTool(tool, args, output, err, progressCallback, context)) {
+            return true;
+        }
+        lastErr = err;
+        if (looksUndecodable(err)) sawUndecodable = true;
+        if (!looksUnsupported(err)) { allUnsupported = false; break; }
+        if (cancelled) { allUnsupported = false; break; }
+    }
+
+    // A failed decode still leaves the empty placeholder files the engine
+    // created, so say so rather than letting them look like a result.
+    if (sawUndecodable) {
+        error = undecodableError(archivePath) +
+                "\nAny files already written to the destination are incomplete.";
+    } else if (allUnsupported) {
+        error = unsupportedFormatError(archivePath);
+    } else {
+        error = lastErr.empty() ? "Extraction failed" : lastErr;
+    }
+    return false;
 }
 
 bool ArchiverCore::createArchive(const std::vector<std::string> &files, const std::string &destination,
@@ -383,11 +527,23 @@ bool ArchiverCore::isArchive(const std::string &path) {
     return false;
 }
 
-std::string ArchiverCore::findTool() {
+std::vector<std::string> ArchiverCore::findTools() {
+    // Engines in preference order. The bundled 7za comes first so the app
+    // stays self-contained, but it is the reduced p7zip build: it has no RAR,
+    // ISO, DMG, WIM (etc.) codecs. A fuller system 7z/7zz is therefore kept as
+    // a fallback, and callers retry down this list when an engine reports that
+    // it cannot open a file as an archive.
+    std::vector<std::string> tools;
 #if defined(__APPLE__)
     auto exists = [](const std::string &p) -> bool { return access(p.c_str(), X_OK) == 0; };
+    auto add = [&tools](const std::string &p) {
+        if (p.empty()) return;
+        if (std::find(tools.begin(), tools.end(), p) != tools.end()) return;
+        if (!isUsableEngine(p)) return;
+        tools.push_back(p);
+    };
 
-    // 1. Check app bundle's Resources/bin/7za (embedded in .app bundle)
+    // 1. The copy embedded in the app bundle, then an executable-relative one.
     char exeBuf[PATH_MAX];
     uint32_t exeSize = sizeof(exeBuf);
     if (_NSGetExecutablePath(exeBuf, &exeSize) == 0) {
@@ -401,39 +557,45 @@ std::string ArchiverCore::findTool() {
             if (resolved) {
                 std::string resolvedStr(resolved);
                 ::free(resolved);
-                if (exists(resolvedStr)) return resolvedStr;
+                if (exists(resolvedStr)) add(resolvedStr);
             }
             // Sidecar: executable-relative bin/7za
             std::string sidecar = exeDir + "/bin/7za";
-            if (exists(sidecar)) return sidecar;
+            if (exists(sidecar)) add(sidecar);
         }
     }
 
-    // 2. Check well-known system paths
-    std::vector<std::string> candidates = {
+    // 2. Well-known system paths. 7z/7zz ship the full codec set, so they are
+    //    tried before a system 7za.
+    static const char *candidates[] = {
         "/opt/homebrew/bin/7z", "/usr/local/bin/7z", "/usr/bin/7z",
-        "/opt/homebrew/bin/7za", "/usr/local/bin/7za",
-        "/opt/homebrew/bin/7zz", "/usr/local/bin/7zz"
+        "/opt/homebrew/bin/7zz", "/usr/local/bin/7zz", "/usr/bin/7zz",
+        "/opt/homebrew/bin/7za", "/usr/local/bin/7za"
     };
-    for (const auto &p : candidates) {
-        if (exists(p)) return p;
+    for (const char *p : candidates) {
+        if (exists(p)) add(p);
     }
 
-    // 3. Scan PATH
+    // 3. Anything else on PATH.
     const char *pathEnv = getenv("PATH");
     if (pathEnv) {
-        std::string pathStr(pathEnv);
-        std::istringstream ss(pathStr);
+        std::istringstream ss(std::string{pathEnv});
         std::string dir;
         while (std::getline(ss, dir, ':')) {
-            std::string c = dir + "/7z";
-            if (exists(c)) return c;
-            c = dir + "/7za";
-            if (exists(c)) return c;
+            if (dir.empty()) continue;
+            for (const char *name : {"/7z", "/7zz", "/7za"}) {
+                std::string c = dir + name;
+                if (exists(c)) add(c);
+            }
         }
     }
 #endif
-    return "";
+    return tools;
+}
+
+std::string ArchiverCore::findTool() {
+    auto tools = findTools();
+    return tools.empty() ? std::string{} : tools.front();
 }
 
 bool ArchiverCore::isToolAvailable() {
@@ -532,6 +694,13 @@ bool ArchiverCore::executeTool(const std::string &prog, const std::vector<std::s
         close(stderr_pipe[0]); close(stderr_pipe[1]);
         error = "Failed to create stdin pipe";
         return false;
+    }
+
+    if (getenv("SEVENZIP_DEBUG")) {
+        std::string line = "[7z] exec: " + prog;
+        for (const auto &a : args) line += " " + a;
+        line += "\n";
+        write(STDERR_FILENO, line.c_str(), line.size());
     }
 
     pid_t pid = fork();

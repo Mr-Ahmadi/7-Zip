@@ -174,8 +174,8 @@ final class ArchiveService: ObservableObject {
 
     private func performOpen(path: String, password: String?) async throws {
         action = .loading
+        let previousPath = archivePath
         archivePath = path
-        addRecent(path)
 
         do {
             let entries = try await withCheckedThrowingContinuation { (c: CheckedContinuation<[ArchiveEntry], Error>) in
@@ -189,6 +189,8 @@ final class ArchiveService: ObservableObject {
                 }
             }
             self.entries = entries
+            // Only remember an archive that actually opened.
+            addRecent(path)
             action = .idle
         } catch let error as ArchiveError {
             if password == nil && error.isEncrypted {
@@ -197,6 +199,10 @@ final class ArchiveService: ObservableObject {
                 action = .idle
                 return
             }
+            // Leaving archivePath set would show an empty browser as though the
+            // archive had opened and were simply empty.
+            archivePath = previousPath
+            entries = []
             action = .failure(error.localizedDescription)
             throw error
         }

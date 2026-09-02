@@ -25,3 +25,6 @@ SevenZipSwift/SevenZip.xcodeproj/
 
 # Logs
 *.log
+
+# Local test archives — never commit sample data
+sample/

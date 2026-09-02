@@ -15,19 +15,76 @@ ArchiveService::ArchiveService(QObject *parent) : QObject(parent) {}
 // ═══════════════════════════════════════════════════════════════════════════
 // Tool helpers
 // ═══════════════════════════════════════════════════════════════════════════
+/// A genuine 7-Zip/p7zip engine answers `i` with its format table and exits 0.
+/// This project installs its own CLI as /usr/local/bin/7z, so a binary merely
+/// named `7z` must be verified before it is driven as an engine.
+static bool isUsableEngine(const QString &path)
+{
+    static QHash<QString, bool> cache;
+    auto it = cache.constFind(path);
+    if (it != cache.constEnd()) return it.value();
+
+    QProcess probe;
+    probe.start(path, {"i"});
+    bool ok = probe.waitForFinished(4000) &&
+              probe.exitStatus() == QProcess::NormalExit &&
+              probe.exitCode() == 0 &&
+              QString::fromUtf8(probe.readAllStandardOutput()).contains("7-Zip");
+    cache.insert(path, ok);
+    return ok;
+}
+
+QStringList ArchiveService::engineCandidates()
+{
+    // Preference order. The bundled 7za keeps the app self-contained but is the
+    // reduced p7zip build with no RAR/ISO/DMG/WIM codecs, so fuller system
+    // engines follow it as fallbacks.
+    QStringList out;
+    auto add = [&out](const QString &p) {
+        if (p.isEmpty() || out.contains(p)) return;
+        if (!QFileInfo::exists(p) || !isUsableEngine(p)) return;
+        out << p;
+    };
+
+    const QString dir = QCoreApplication::applicationDirPath();
+    add(QFileInfo(dir + "/../Resources/bin/7za").absoluteFilePath());
+    add(QFileInfo(dir + "/bin/7za").absoluteFilePath());
+    for (const QString &p : {QStringLiteral("/opt/homebrew/bin/7z"),
+                             QStringLiteral("/usr/local/bin/7z"),
+                             QStringLiteral("/usr/bin/7z"),
+                             QStringLiteral("/opt/homebrew/bin/7zz"),
+                             QStringLiteral("/usr/local/bin/7zz"),
+                             QStringLiteral("/opt/homebrew/bin/7za"),
+                             QStringLiteral("/usr/local/bin/7za")}) {
+        add(p);
+    }
+    for (const QString &name : {QStringLiteral("7z"), QStringLiteral("7zz"), QStringLiteral("7za")}) {
+        add(QStandardPaths::findExecutable(name));
+    }
+    return out;
+}
+
 QString ArchiveService::bundledTool()
 {
-    QString bundle = QCoreApplication::applicationDirPath() + "/../Resources/bin/7za";
-    if (QFileInfo::exists(bundle)) return QFileInfo(bundle).absoluteFilePath();
-    QString sidecar = QCoreApplication::applicationDirPath() + "/bin/7za";
-    if (QFileInfo::exists(sidecar)) return QFileInfo(sidecar).absoluteFilePath();
-    QStringList paths = {"/opt/homebrew/bin/7z","/usr/local/bin/7z","/usr/bin/7z",
-                          "/opt/homebrew/bin/7za","/usr/local/bin/7za"};
-    for (const auto &p : paths) if (QFileInfo::exists(p)) return p;
-    return QStandardPaths::findExecutable("7z");
+    const QStringList tools = engineCandidates();
+    return tools.isEmpty() ? QString() : tools.first();
 }
 
 bool ArchiveService::isBundledAvailable() { return !bundledTool().isEmpty(); }
+
+/// An engine reporting it cannot read the file may simply lack the codec, so a
+/// fuller engine is worth trying. Password failures are excluded: they are a
+/// real answer, and the UI keys its prompt off that message.
+static bool looksUnsupported(const QString &err)
+{
+    const QString e = err.toLower();
+    if (e.contains("password") || e.contains("encrypted")) return false;
+    return e.contains("can not open the file as archive") ||
+           e.contains("cannot open the file as archive") ||
+           e.contains("is not supported archive") ||
+           e.contains("unsupported archive") ||
+           e.contains("unsupported method");
+}
 
 QString ArchiveService::formatSize(qint64 bytes)
 {
@@ -106,6 +163,7 @@ void ArchiveService::startProc(const QString &prog, const QStringList &args)
     });
     m_out.clear();
     m_timer.start();
+    m_lastArgs = args;
     m_proc->start(prog, args);
 }
 
@@ -120,6 +178,7 @@ void ArchiveService::cancel()
 void ArchiveService::listContents(const QString &archivePath)
 {
     m_op = List;
+    m_engineIndex = 0;
     QString tool = bundledTool();
     if (tool.isEmpty()) {
         emit errorOccurred("7za not found. Install p7zip or ensure the bundled binary is present.");
@@ -132,6 +191,7 @@ void ArchiveService::extractArchive(const QString &archivePath, const QString &d
                                     const QString &password)
 {
     m_op = Extract;
+    m_engineIndex = 0;
     QDir().mkpath(destination);
     QString tool = bundledTool();
     if (tool.isEmpty()) {
@@ -237,13 +297,28 @@ void ArchiveService::onProcessFinished(int exitCode, QProcess::ExitStatus status
     }
 
     if (status != QProcess::NormalExit || exitCode != 0) {
+        QString err;
+        if (m_proc) err = QString::fromUtf8(m_proc->readAllStandardError());
+        if (err.isEmpty()) err = QString::fromUtf8(m_out).left(500);
+
+        // The bundled engine is a reduced build; if it cannot read this format,
+        // retry the same command on a fuller one rather than reporting failure.
+        if ((m_op == List || m_op == Extract) && looksUnsupported(err)) {
+            const QStringList tools = engineCandidates();
+            if (m_engineIndex + 1 < tools.size()) {
+                m_engineIndex++;
+                const QString next = tools.at(m_engineIndex);
+                const QStringList args = m_lastArgs;
+                if (m_proc) { m_proc->deleteLater(); m_proc = nullptr; }
+                QTimer::singleShot(0, this, [this, next, args] { startProc(next, args); });
+                return;
+            }
+        }
+
         m_pendingCompress.clear();
         m_compoundDir.reset();
         if (!m_compoundStaged.isEmpty()) { QFile::remove(m_compoundStaged); m_compoundStaged.clear(); }
         m_compoundFinal.clear();
-        QString err;
-        if (m_proc) err = QString::fromUtf8(m_proc->readAllStandardError());
-        if (err.isEmpty()) err = QString::fromUtf8(m_out).left(500);
         emit errorOccurred(err.isEmpty()
             ? QString("Process exit code %1").arg(exitCode)
             : err.trimmed());

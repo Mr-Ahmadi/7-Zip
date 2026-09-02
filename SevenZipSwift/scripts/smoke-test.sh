@@ -208,6 +208,39 @@ expect_fail "unknown option is rejected"           --bogus
 expect_fail "creating with no inputs is rejected"  create empty.zip
 expect_fail "creating from a missing file fails"   create x.zip no-such-file.txt
 
+# ── Engine selection ─────────────────────────────────────────────────
+section "Engine selection"
+engine="$("$BIN" --tool 2>/dev/null)"
+# This project installs its own CLI as /usr/local/bin/7z. Driving that as an
+# archive engine is nonsense, so the resolved engine must be a real 7-Zip:
+# a genuine engine answers `i` with its format table and exits 0.
+if [ -n "$engine" ] && "$engine" i 2>/dev/null | grep -q "7-Zip"; then
+    ok "resolved engine is a real 7-Zip build"
+else
+    bad "resolved engine is not a 7-Zip engine" "$engine"
+fi
+if [ "$(readlink -f "$engine" 2>/dev/null || echo "$engine")" = \
+     "$(readlink -f "$BIN" 2>/dev/null || echo "$BIN")" ]; then
+    bad "the CLI selected itself as its own archive engine"
+else
+    ok "the CLI does not select itself as an engine"
+fi
+
+# ── Unreadable archives report an error, never an empty listing ──────
+section "Unreadable input"
+# The GUI showed an empty window for archives it could not read; the CLI must
+# not paper over that either.
+printf 'this is definitely not an archive' > bogus.rar
+out="$("$BIN" list bogus.rar 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "an unreadable archive reported success"
+elif echo "$out" | grep -q "0 entries"; then
+    bad "an unreadable archive was reported as empty rather than failing"
+else
+    ok "an unreadable archive fails with an error, not an empty listing"
+fi
+
 # ── Housekeeping ─────────────────────────────────────────────────────
 section "Housekeeping"
 TEMP_AFTER="$(ls -d "${TMPDIR:-/tmp}"/7z-* 2>/dev/null | wc -l | tr -d ' ')"

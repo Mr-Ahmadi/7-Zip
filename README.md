@@ -29,7 +29,22 @@ in this order:
 2. a `bin/7za` sidecar next to the executable
 3. a system `7z` / `7za` / `7zz` on the usual prefixes or on `PATH`
 
-Run `7z --tool` to print the engine actually in use.
+Run `7z --tool` to print the engine actually in use, and set `SEVENZIP_DEBUG=1`
+to trace every engine invocation on stderr.
+
+The bundled `7za` is p7zip's *reduced* build: it handles 7z, zip, tar, gzip,
+bzip2, xz, Z and zstd, but has **no RAR, ISO, DMG, WIM or CAB codecs**. When it
+cannot read a file, the app automatically retries with a fuller system engine,
+so install one for those formats:
+
+```bash
+brew install sevenzip   # provides 7zz — the official 7-Zip, widest format support
+brew install p7zip      # provides 7z — older, no RAR5 support past ~2023
+```
+
+Without a capable engine you get a clear error rather than an empty window.
+Note that p7zip 17.x cannot decode RAR archives written by recent versions of
+WinRAR; `sevenzip` (7zz) is the one to install for those.
 
 ### Build & Install (SwiftUI App)
 
@@ -117,8 +132,8 @@ make
 | ------ | :----: | :-----: |
 | 7z, zip, tar | ✓ | ✓ |
 | tar.gz, tar.bz2, tar.xz | ✓ | ✓ |
-| rar | — | ✓ |
-| iso, cab, dmg, wim, arj, lzh, … | — | ✓ |
+| rar | — | ✓ (needs a system engine) |
+| iso, cab, dmg, wim, arj, lzh, … | — | ✓ (needs a system engine) |
 
 Compound formats (`tar.gz`, `tar.bz2`, `tar.xz`) are built in two steps: the
 files go into a tar named after the final archive, which is then compressed.
