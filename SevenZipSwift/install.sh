@@ -18,6 +18,50 @@ info()  { printf "${GREEN}==>${NC} ${BOLD}%s${NC}\n" "$1"; }
 warn()  { printf "${YELLOW}==>${NC} %s\n" "$1"; }
 error() { printf "${RED}==>${NC} %s\n" "$1"; }
 
+# ── Privilege helpers ───────────────────────────────────────────────
+#
+# Only the install steps need root. Compiling as root would leave the .build
+# cache owned by root, and every later `swift build` run as a normal user
+# would then fail with "Operation not permitted" — so builds always drop back
+# to the invoking user.
+
+as_user() {
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+        sudo -u "$SUDO_USER" "$@"
+    else
+        "$@"
+    fi
+}
+
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+# Repair a .build tree poisoned by an earlier `sudo ./install.sh`.
+fix_build_ownership() {
+    local build="$PROJECT_DIR/.build"
+    [ -d "$build" ] || return 0
+
+    local owner count
+    owner="${SUDO_USER:-$(id -un)}"
+    count="$(find "$build" ! -user "$owner" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "$count" -eq 0 ]; then
+        return 0
+    fi
+
+    warn "$count build artifact(s) in .build are not owned by $owner."
+    warn "An earlier 'sudo ./install.sh' left them behind; reclaiming them."
+    as_root chown -R "$owner" "$build" || {
+        error "Could not reclaim .build. Remove it and retry:"
+        echo "  sudo rm -rf \"$build\""
+        exit 1
+    }
+}
+
 # Detect the SPM build output directory (includes target triple)
 detect_build_dir() {
     local config="${1:-release}"
@@ -63,14 +107,14 @@ check_prereqs() {
 
 install_cli() {
     info "Building 7z CLI (release)..."
-    swift build --product 7z -c release
+    as_user swift build --product 7z -c release
 
     local build_dir
     build_dir="$(detect_build_dir "release")"
     info "Installing 7z to /usr/local/bin/..."
-    mkdir -p /usr/local/bin
-    cp -f "$build_dir/7z" /usr/local/bin/7z
-    chmod +x /usr/local/bin/7z
+    as_root mkdir -p /usr/local/bin
+    as_root cp -f "$build_dir/7z" /usr/local/bin/7z
+    as_root chmod +x /usr/local/bin/7z
     echo "  ✓ /usr/local/bin/7z"
 }
 
@@ -78,21 +122,21 @@ install_cli() {
 
 install_gui() {
     info "Building 7-Zip GUI (release)..."
-    swift build --product "7-Zip" -c release
+    as_user swift build --product "7-Zip" -c release
 
     local build_dir
     build_dir="$(detect_build_dir "release")"
     info "Creating 7-Zip.app bundle..."
-    bash "$PROJECT_DIR/scripts/make-app-bundle.sh" "$build_dir"
+    as_user bash "$PROJECT_DIR/scripts/make-app-bundle.sh" "$build_dir"
 
     info "Installing 7-Zip.app to /Applications/..."
     local app_src="$build_dir/7-Zip.app"
     if [ -d "$app_src" ]; then
-        rm -rf /Applications/7-Zip.app 2>/dev/null || true
-        cp -Rf "$app_src" /Applications/7-Zip.app
+        as_root rm -rf /Applications/7-Zip.app 2>/dev/null || true
+        as_root cp -Rf "$app_src" /Applications/7-Zip.app
         echo "  ✓ /Applications/7-Zip.app"
 
-        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+        as_root /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
             -f /Applications/7-Zip.app 2>/dev/null || true
     else
         warn "App bundle not found at $app_src"
@@ -105,12 +149,14 @@ uninstall() {
     info "Removing 7-Zip..."
     local n=0
     if [ -f /usr/local/bin/7z ]; then
-        rm -f /usr/local/bin/7z && echo "  ✓ /usr/local/bin/7z" && n=$((n + 1))
+        as_root rm -f /usr/local/bin/7z && echo "  ✓ /usr/local/bin/7z" && n=$((n + 1))
     fi
     if [ -d /Applications/7-Zip.app ]; then
-        rm -rf /Applications/7-Zip.app && echo "  ✓ /Applications/7-Zip.app" && n=$((n + 1))
+        as_root rm -rf /Applications/7-Zip.app && echo "  ✓ /Applications/7-Zip.app" && n=$((n + 1))
     fi
-    [ "$n" -eq 0 ] && echo "  Nothing to remove."
+    if [ "$n" -eq 0 ]; then
+        echo "  Nothing to remove."
+    fi
 }
 
 # ── Main ────────────────────────────────────────────────────────────
@@ -126,11 +172,13 @@ case "${1:-install}" in
         cd "$PROJECT_DIR"
 
         if [ "$(id -u)" -ne 0 ]; then
-            warn "Some operations require sudo (writing to /usr/local/bin, /Applications)."
-            warn "Re-run with sudo if you see permission errors."
+            warn "Installing to /usr/local/bin and /Applications needs sudo;"
+            warn "you may be prompted for your password. Do not run this whole"
+            warn "script with sudo — that would leave .build owned by root."
             echo ""
         fi
 
+        fix_build_ownership
         check_prereqs
         echo ""
         install_cli
@@ -143,12 +191,9 @@ case "${1:-install}" in
         echo "  TUI:  7z"
         echo "  GUI:  open /Applications/7-Zip.app"
         echo ""
-        echo "  Remove: sudo $0 uninstall"
+        echo "  Remove: $0 uninstall"
         ;;
     uninstall)
-        if [ "$(id -u)" -ne 0 ]; then
-            exec sudo "$0" uninstall
-        fi
         uninstall
         ;;
     *)

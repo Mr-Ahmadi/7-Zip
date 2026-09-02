@@ -42,11 +42,13 @@ swift build --product "7-Zip" --configuration release
 # Build CLI tool
 swift build --product "7z" --configuration release
 
-# Install to /Applications and /usr/local/bin
+# Install to /Applications and /usr/local/bin.
+# Run it as yourself, NOT with sudo — it elevates only the steps that need
+# root, so the build cache stays owned by you.
 ./install.sh
 
 # Remove
-sudo ./install.sh uninstall
+./install.sh uninstall
 ```
 
 ### Build (Qt/C++ App)
