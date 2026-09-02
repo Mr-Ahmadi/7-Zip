@@ -7,10 +7,12 @@ A native macOS archive manager with both **GUI** and **CLI** interfaces.
 ## Features
 
 - **SwiftUI GUI** – modern macOS app with archive browsing, extraction, and creation
-- **CLI + TUI** – command-line tool with terminal UI mode (`7z list`, `7z extract`, `7z create`)
+- **CLI + TUI** – command-line tool with an interactive terminal UI
 - **Formats** – 7z, ZIP, RAR (extract), TAR, GZ, BZ2, XZ, ISO and more
+- **Password support** – create and open encrypted archives
 - **File associations** – right-click any archive → "Open With" → 7-Zip
 - **Drag & drop** – drop archives onto the app window
+- **Self-contained** – the archive engine ships inside the app bundle
 
 ## Quick Start
 
@@ -18,7 +20,16 @@ A native macOS archive manager with both **GUI** and **CLI** interfaces.
 
 - macOS 14+
 - Xcode 15+ (or Command Line Tools)
-- [p7zip](https://p7zip.sourceforge.net/) (`7za` binary must be on PATH)
+
+The `7za` archive engine is bundled in `resources/bin/` and gets embedded into
+the app bundle, so no separate p7zip install is needed. The engine is resolved
+in this order:
+
+1. `7-Zip.app/Contents/Resources/bin/7za` (embedded)
+2. a `bin/7za` sidecar next to the executable
+3. a system `7z` / `7za` / `7zz` on the usual prefixes or on `PATH`
+
+Run `7z --tool` to print the engine actually in use.
 
 ### Build & Install (SwiftUI App)
 
@@ -31,8 +42,11 @@ swift build --product "7-Zip" --configuration release
 # Build CLI tool
 swift build --product "7z" --configuration release
 
-# Install to /Applications
+# Install to /Applications and /usr/local/bin
 ./install.sh
+
+# Remove
+sudo ./install.sh uninstall
 ```
 
 ### Build (Qt/C++ App)
@@ -54,9 +68,12 @@ make
 │   │   ├── CSevenZip/     #   C++ archive bridge
 │   │   └── CNcurses/      #   NCurses wrapper
 │   ├── Resources/         # Icons, asset catalog
+│   ├── scripts/
+│   │   ├── make-app-bundle.sh  # Assemble 7-Zip.app
+│   │   └── smoke-test.sh       # End-to-end CLI test suite
 │   └── install.sh         # Install/uninstall script
 ├── src/                   # Qt/C++ implementation
-├── resources/             # Qt app resources
+├── resources/             # Qt app resources + bundled 7za
 └── CMakeLists.txt         # Qt build config
 ```
 
@@ -65,19 +82,68 @@ make
 **GUI:** Launch from Applications or open archives via right-click → "Open With".
 
 **CLI:**
+
 ```bash
 # List archive contents
 7z list archive.7z
 
-# Extract archive
+# Extract archive (defaults to the current directory)
 7z extract archive.7z
+7z extract archive.7z ./output
 
-# Create archive
+# Create archive — the format follows the extension
 7z create output.7z file1.txt file2.txt
+7z create backup.tar.gz ./folder
+
+# Override the format explicitly, set compression, encrypt
+7z create -t 7z -mx 9 -p secret archive.7z folder/
+
+# Open an encrypted archive
+7z list -p secret archive.7z
+
+# Show which archive engine is in use
+7z --tool
 
 # Interactive terminal UI
-tui archive.7z
+7z
+7z --tui
 ```
+
+### Formats
+
+| Format | Create | Extract |
+| ------ | :----: | :-----: |
+| 7z, zip, tar | ✓ | ✓ |
+| tar.gz, tar.bz2, tar.xz | ✓ | ✓ |
+| rar | — | ✓ |
+| iso, cab, dmg, wim, arj, lzh, … | — | ✓ |
+
+Compound formats (`tar.gz`, `tar.bz2`, `tar.xz`) are built in two steps: the
+files go into a tar named after the final archive, which is then compressed.
+Extracting one yields the inner `.tar`, matching standard 7-Zip behaviour.
+
+When `-t` is omitted, the format is inferred from the destination extension
+(`.tgz`, `.tbz2` and `.txz` are recognised as their compound equivalents), and
+falls back to zip for an unknown extension.
+
+## Testing
+
+`scripts/smoke-test.sh` drives the real archive engine end to end — no mocks —
+covering round-trips for every creatable format, format inference, compound
+archive internals, listing edge cases, passwords, error handling, and temp-file
+cleanup.
+
+```bash
+cd SevenZipSwift
+
+# Build the release CLI, then test it
+./scripts/smoke-test.sh
+
+# Or test a binary you already built
+./scripts/smoke-test.sh /usr/local/bin/7z
+```
+
+It exits non-zero if any case fails.
 
 ## License
 

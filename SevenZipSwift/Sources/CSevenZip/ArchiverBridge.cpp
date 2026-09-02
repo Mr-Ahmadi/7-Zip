@@ -9,6 +9,7 @@
 #include <regex>
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>
 #include <unordered_map>
 
 #if defined(__APPLE__)
@@ -182,6 +183,89 @@ char *archiver_find_tool(void) {
 // ArchiverCore Implementation
 // ══════════════════════════════════════════════════════════════════════
 
+namespace {
+
+std::string toLower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    return s;
+}
+
+void rtrim(std::string &s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(),
+                         [](unsigned char c) { return !std::isspace(c); }).base(),
+            s.end());
+}
+
+/// Parse a (possibly blank or space-padded) numeric column. Never throws.
+int64_t parseInt64(const std::string &field) {
+    int64_t value = 0;
+    bool any = false;
+    for (unsigned char c : field) {
+        if (std::isdigit(c)) {
+            value = value * 10 + (c - '0');
+            any = true;
+        } else if (any) {
+            break;
+        }
+    }
+    return any ? value : 0;
+}
+
+/// Longest-suffix match of a destination path to a 7za format name.
+/// Returns "" when the extension is not recognised.
+std::string inferFormat(const std::string &destination) {
+    static const std::vector<std::pair<std::string, std::string>> suffixes = {
+        {".tar.gz", "tar.gz"},   {".tgz", "tar.gz"},
+        {".tar.bz2", "tar.bz2"}, {".tbz2", "tar.bz2"}, {".tbz", "tar.bz2"},
+        {".tar.xz", "tar.xz"},   {".txz", "tar.xz"},
+        {".7z", "7z"},           {".zip", "zip"},      {".tar", "tar"},
+        {".gz", "gzip"},         {".bz2", "bzip2"},    {".xz", "xz"},
+    };
+    std::string lower = toLower(destination);
+    for (const auto &[suffix, format] : suffixes) {
+        if (lower.size() > suffix.size() &&
+            lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            return format;
+        }
+    }
+    return "";
+}
+
+/// Name the intermediate tar after the final archive, so that decompressing
+/// e.g. `photos.tar.gz` yields `photos.tar` rather than a temp-file name.
+std::string innerTarName(const std::string &destination) {
+    auto slash = destination.rfind('/');
+    std::string base = (slash == std::string::npos) ? destination
+                                                     : destination.substr(slash + 1);
+    std::string lower = toLower(base);
+    static const std::vector<std::string> stripped = {
+        ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".tbz", ".txz"
+    };
+    for (const auto &suffix : stripped) {
+        if (lower.size() > suffix.size() &&
+            lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            // ".tgz" and friends collapse the ".tar" too — put it back below.
+            base = base.substr(0, base.size() - suffix.size());
+            lower = toLower(base);
+            break;
+        }
+    }
+    if (base.empty()) base = "archive";
+    if (!(lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".tar") == 0)) {
+        base += ".tar";
+    }
+    return base;
+}
+
+std::string tempDirRoot() {
+    const char *tmp = getenv("TMPDIR");
+    std::string root = (tmp && *tmp) ? tmp : "/tmp";
+    if (!root.empty() && root.back() == '/') root.pop_back();
+    return root;
+}
+
+}  // namespace
+
 std::vector<InternalEntry> ArchiverCore::listArchive(const std::string &archivePath, const std::string &password, std::string &error) {
     action = CAction::List;
     cancelled = false;
@@ -220,10 +304,17 @@ bool ArchiverCore::createArchive(const std::vector<std::string> &files, const st
     std::string tool = findTool();
     if (tool.empty()) { error = "No archive tool found."; return false; }
 
+    // An empty format means "derive it from the destination extension".
+    std::string fmt = toLower(format);
+    if (fmt.empty()) {
+        fmt = inferFormat(destination);
+        if (fmt.empty()) fmt = "zip";
+    }
+
     // Compound formats (tar.gz, tar.bz2, tar.xz) need two-step creation
     static const std::vector<std::string> compoundFormats = {"tar.gz", "tar.bz2", "tar.xz"};
-    if (std::find(compoundFormats.begin(), compoundFormats.end(), format) != compoundFormats.end()) {
-        std::string ext = format.substr(format.find('.') + 1);
+    if (std::find(compoundFormats.begin(), compoundFormats.end(), fmt) != compoundFormats.end()) {
+        std::string ext = fmt.substr(fmt.find('.') + 1);
         // Map extension to 7za format name: gz→gzip, bz2→bzip2, xz→xz
         static const std::unordered_map<std::string, std::string> fmtMap = {
             {"gz", "gzip"}, {"bz2", "bzip2"}, {"xz", "xz"}
@@ -235,11 +326,11 @@ bool ArchiverCore::createArchive(const std::vector<std::string> &files, const st
                                       progressCallback, context);
     }
 
-    std::vector<std::string> args = {"a", "-t" + format, destination,
+    std::vector<std::string> args = {"a", "-t" + fmt, destination,
                                      "-mx=" + std::to_string(compressionLevel), "-y"};
     if (!password.empty()) {
         args.push_back("-p" + password);
-        if (format == "7z") args.push_back("-mhe=on");
+        if (fmt == "7z") args.push_back("-mhe=on");
     }
     for (const auto &f : files) args.push_back(f);
     std::string output;
@@ -259,7 +350,14 @@ void ArchiverCore::cancel() {
 }
 
 bool ArchiverCore::isArchive(const std::string &path) {
-    static const char *exts[] = {"7z","zip","rar","tar","gz","bz2","xz","tgz","tbz2","txz"};
+    // Kept in sync with CFBundleTypeExtensions in scripts/make-app-bundle.sh —
+    // Finder offers "Open With 7-Zip" for each of these, so each must open.
+    static const char *exts[] = {
+        "7z","zip","rar","tar","gz","bz2","xz","tgz","tbz2","tbz","txz","taz",
+        "z","lzma","lz4","zst","iso","cab","arj","lzh","lha","wim","swm","esd",
+        "dmg","hfs","vhd","vhdx","vmdk","cpio","rpm","deb","chm","msi","udf",
+        "squashfs","apfs","qcow2","fat","ntfs","mbr","gpt","xar","pkg"
+    };
     auto dot = path.rfind('.');
     if (dot == std::string::npos) return false;
     std::string ext = path.substr(dot + 1);
@@ -350,15 +448,26 @@ bool ArchiverCore::createCompoundArchive(const std::vector<std::string> &files,
                                           const std::string &password,
                                           std::string &error,
                                           CProgressCallback progress, void *context) {
-    // Step 1: Create inner archive (tar) to a temp file
+    // Step 1: Create the inner tar inside a private temp directory.
+    //
+    // 7za appends the format extension when the output path has none, so the
+    // tar must already end in ".tar" or it lands somewhere we do not expect.
+    // It is named after the final archive so that decompressing `x.tar.gz`
+    // yields `x.tar` rather than a temp-file name.
     std::string tool = findTool();
-    char tempPath[] = "/tmp/7z-tar-XXXXXX";
-    int fd = mkstemp(tempPath);
-    if (fd < 0) { error = "Failed to create temp file"; return false; }
-    close(fd);
+    std::string dirTemplate = tempDirRoot() + "/7z-XXXXXX";
+    std::vector<char> dirBuf(dirTemplate.begin(), dirTemplate.end());
+    dirBuf.push_back('\0');
+    if (!mkdtemp(dirBuf.data())) { error = "Failed to create temp directory"; return false; }
+    std::string tempDir(dirBuf.data());
+    std::string tarPath = tempDir + "/" + innerTarName(destination);
 
-    std::vector<std::string> innerArgs = {"a", "-t" + innerFormat, tempPath,
-                                           "-mx=" + std::to_string(compressionLevel), "-y"};
+    auto cleanup = [&]() {
+        unlink(tarPath.c_str());
+        rmdir(tempDir.c_str());
+    };
+
+    std::vector<std::string> innerArgs = {"a", "-t" + innerFormat, tarPath, "-y"};
     for (const auto &f : files) innerArgs.push_back(f);
 
     std::string innerOutput;
@@ -366,14 +475,21 @@ bool ArchiverCore::createCompoundArchive(const std::vector<std::string> &files,
     bool innerOk = executeTool(tool, innerArgs, innerOutput, innerErr, nullptr, nullptr);
     if (!innerOk) {
         error = innerErr.empty() ? "Failed to create intermediate archive" : innerErr;
-        unlink(tempPath);
+        cleanup();
         return false;
     }
 
-    if (cancelled) { unlink(tempPath); error = "Cancelled"; return false; }
+    if (cancelled) { cleanup(); error = "Cancelled"; return false; }
 
-    // Step 2: Compress the temp tar into the final archive
-    std::vector<std::string> compressArgs = {"a", "-t" + compressionFormat, destination, tempPath,
+    // Step 2: Compress the tar into the final archive. gzip/bzip2/xz are
+    // single-stream formats that 7za cannot append to, so an existing
+    // destination has to be replaced. Build the result beside it under a
+    // temporary name and rename it into place only once it is complete —
+    // a failure here must not destroy the archive that was already there.
+    std::string stagedPath = destination + ".7z-part" + std::to_string(getpid());
+    unlink(stagedPath.c_str());
+
+    std::vector<std::string> compressArgs = {"a", "-t" + compressionFormat, stagedPath, tarPath,
                                               "-mx=" + std::to_string(compressionLevel), "-y"};
     if (!password.empty()) {
         compressArgs.push_back("-p" + password);
@@ -381,8 +497,18 @@ bool ArchiverCore::createCompoundArchive(const std::vector<std::string> &files,
 
     std::string compressOutput;
     bool ok = executeTool(tool, compressArgs, compressOutput, error, progress, context);
-    unlink(tempPath);
-    return ok;
+    cleanup();
+
+    if (!ok) {
+        unlink(stagedPath.c_str());
+        return false;
+    }
+    if (rename(stagedPath.c_str(), destination.c_str()) != 0) {
+        error = "Failed to write " + destination + ": " + strerror(errno);
+        unlink(stagedPath.c_str());
+        return false;
+    }
+    return true;
 }
 
 bool ArchiverCore::executeTool(const std::string &prog, const std::vector<std::string> &args,
@@ -419,7 +545,15 @@ bool ArchiverCore::executeTool(const std::string &prog, const std::vector<std::s
 
     if (pid == 0) {
         close(stdout_pipe[0]); close(stderr_pipe[0]);
-        if (stdin_pipe[1] >= 0) { close(stdin_pipe[1]); dup2(stdin_pipe[0], STDIN_FILENO); close(stdin_pipe[0]); }
+        if (stdin_pipe[1] >= 0) {
+            close(stdin_pipe[1]); dup2(stdin_pipe[0], STDIN_FILENO); close(stdin_pipe[0]);
+        } else {
+            // Never let the child inherit our stdin: 7za prompts for a
+            // password on an encrypted archive and would block forever
+            // waiting for input nobody is there to type.
+            int devnull = open("/dev/null", O_RDONLY);
+            if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
+        }
         dup2(stdout_pipe[1], STDOUT_FILENO);
         dup2(stderr_pipe[1], STDERR_FILENO);
         close(stdout_pipe[1]); close(stderr_pipe[1]);
@@ -504,51 +638,70 @@ bool ArchiverCore::executeTool(const std::string &prog, const std::vector<std::s
 }
 
 std::vector<InternalEntry> ArchiverCore::parseOutput(const std::string &data) {
+    // `7za l -ba` emits fixed-width columns:
+    //
+    //   2026-09-02 12:16:42 D....            0            0  path/to/name
+    //   |0-9      |11-18    |20-24 |26-37        |39-50      |53+
+    //
+    // The packed column is blank for entries inside a solid block, and the
+    // name begins at column 53 — so it is read by offset rather than by
+    // splitting on whitespace, which would corrupt names containing runs of
+    // two or more spaces.
+    constexpr size_t kNameColumn = 53;
+
+    auto hasDatePrefix = [](const std::string &l) {
+        if (l.size() < 19) return false;
+        auto digit = [&](size_t i) { return std::isdigit(static_cast<unsigned char>(l[i])) != 0; };
+        return digit(0) && digit(1) && digit(2) && digit(3) && l[4] == '-' &&
+               digit(5) && digit(6) && l[7] == '-' && digit(8) && digit(9) && l[10] == ' ';
+    };
+
     std::vector<InternalEntry> entries;
     std::istringstream stream(data);
     std::string line;
 
     while (std::getline(stream, line)) {
+        rtrim(line);  // drop any trailing CR from the pipe
         if (line.empty()) continue;
-        std::regex splitRe(R"(\s{2,})");
-        std::sregex_token_iterator it(line.begin(), line.end(), splitRe, -1);
-        std::sregex_token_iterator end;
-        std::vector<std::string> parts;
-        for (; it != end; ++it) {
-            std::string s = *it;
-            if (!s.empty()) parts.push_back(s);
-        }
-        if (parts.empty()) continue;
-
-        std::istringstream headStream(parts[0]);
-        std::string dateStr, timeStr, attr;
-        headStream >> dateStr >> timeStr >> attr;
 
         InternalEntry entry;
-        if (!dateStr.empty() && !timeStr.empty()) {
-            entry.date = dateStr + " " + timeStr;
-        }
-        entry.isFolder = (!attr.empty() && attr[0] == 'D');
 
-        if (parts.size() >= 3) {
-            entry.size = std::stoll(parts[1]);
-            entry.name = parts.back();
-            if (parts.size() >= 4) {
-                entry.compressedSize = std::stoll(parts[2]);
+        if (hasDatePrefix(line) && line.size() > kNameColumn) {
+            entry.date = line.substr(0, 19);
+            entry.isFolder = line[20] == 'D';
+
+            if (line[51] == ' ' && line[52] == ' ' && line[kNameColumn] != ' ') {
+                // Columns are intact: read each field at its fixed offset.
+                entry.size = parseInt64(line.substr(26, 12));
+                entry.compressedSize = parseInt64(line.substr(39, 12));
+                entry.name = line.substr(kNameColumn);
+            } else {
+                // A size wider than its column shifts everything right; fall
+                // back to reading the attr/size/packed tokens in order.
+                std::istringstream fields(line.substr(19));
+                std::string attr, size, packed;
+                fields >> attr >> size >> packed;
+                entry.size = parseInt64(size);
+                entry.compressedSize = parseInt64(packed);
+                std::streamoff consumed = fields.tellg();
+                if (consumed > 0) {
+                    size_t nameStart = 19 + static_cast<size_t>(consumed);
+                    while (nameStart < line.size() && line[nameStart] == ' ') ++nameStart;
+                    if (nameStart < line.size()) entry.name = line.substr(nameStart);
+                }
             }
-        } else if (parts.size() == 2) {
-            entry.size = std::stoll(parts[1]);
+        } else {
+            // Not a listing row in the expected shape — take the trailing
+            // token so unusual output still yields something usable.
+            std::istringstream fields(line);
+            std::string token;
+            while (fields >> token) entry.name = token;
         }
 
-        if (!entry.name.empty()) {
-            auto trim = [](std::string &s) {
-                s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char c) { return !std::isspace(c); }));
-                s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char c) { return !std::isspace(c); }).base(), s.end());
-            };
-            trim(entry.name);
-            entry.path = entry.name;
-            entries.push_back(entry);
-        }
+        rtrim(entry.name);
+        if (entry.name.empty()) continue;
+        entry.path = entry.name;
+        entries.push_back(entry);
     }
     return entries;
 }

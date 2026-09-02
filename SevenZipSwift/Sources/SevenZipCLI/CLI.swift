@@ -5,6 +5,30 @@ import CSevenZip
 
 func printStderr(_ msg: String) { fputs(msg + "\n", stderr) }
 
+/// Collapses the blank lines 7za pads its diagnostics with.
+func cleanMessage(_ raw: String) -> String {
+    let lines = raw.split(separator: "\n", omittingEmptySubsequences: false)
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    return lines.isEmpty ? raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                         : lines.joined(separator: "\n")
+}
+
+/// Redraws progress in place on stderr. Skipped when stderr is redirected,
+/// so piped output does not fill up with partial progress lines.
+let progressCallback: CProgressCallback = { pct, _ in
+    guard isatty(STDERR_FILENO) == 1 else { return }
+    fputs("\rProgress: \(pct)%", stderr)
+    fflush(stderr)
+}
+
+/// Clears the progress line before printing the final result.
+func clearProgress() {
+    guard isatty(STDERR_FILENO) == 1 else { return }
+    fputs("\r\u{1B}[K", stderr)
+    fflush(stderr)
+}
+
 func printHelp() {
     print("""
 Usage: 7z <command> [options] <archive> [files...]
@@ -16,11 +40,13 @@ Commands:
 
 Options:
   --output, -o   <dir>               Output directory (extract)
-  --format, -t   <format>            Archive format: 7z, zip, tar, tar.gz, tar.bz2, tar.xz
+  --format, -t   <format>            Archive format: 7z, zip, tar, tar.gz, tar.bz2,
+                                     tar.xz (default: from the archive extension)
   --level, -mx   <0-9>              Compression level (default: 5)
   --password, -p <password>          Encrypt/decrypt with password
   --verbose, -V                      Verbose output
   --tui                              Launch interactive TUI
+  --tool                             Show the archive engine being used
   --help, -h                         Show this help
   --version, -v                      Show version
 
@@ -37,14 +63,15 @@ Examples:
 
 // ── Argument Parsing ─────────────────────────────────────────────────────
 
-enum Command { case list, extract, create, help, version }
+enum Command { case list, extract, create, help, version, tool }
 
 struct Args {
     var command: Command?
     var archive: String?
     var files: [String] = []
     var outputDir = FileManager.default.currentDirectoryPath
-    var format = "zip"
+    /// Empty means "derive the format from the destination extension".
+    var format = ""
     var level = 5
     var password = ""
     var verbose = false
@@ -65,6 +92,7 @@ func parseArgs() -> Args {
         case "--version", "-v": a.command = .version; i += 1
         case "--verbose", "-V": a.verbose = true; i += 1
         case "--tui": a.tui = true; i += 1
+        case "--tool": a.command = .tool; i += 1
         case "--output", "-o":
             if i + 1 < args.count { a.outputDir = args[i + 1]; i += 2 } else { i += 1 }
         case "--format", "-t":
@@ -85,7 +113,7 @@ func parseArgs() -> Args {
     }
 
     if explicitHelp { a.command = .help; return a }
-    if a.command == .version { return a }
+    if a.command == .version || a.command == .tool { return a }
 
     if positional.isEmpty || a.tui {
         a.tui = true
@@ -125,6 +153,7 @@ func parseArgs() -> Args {
 @main
 struct App {
     static func main() {
+        setvbuf(stdout, nil, _IOLBF, 0)
         let args = parseArgs()
 
         if args.tui {
@@ -138,6 +167,7 @@ struct App {
         switch cmd {
         case .help: printHelp(); return
         case .version: print("7-Zip CLI 1.0.0"); return
+        case .tool: cmdTool(); return
         case .list: cmdList(args: args)
         case .extract: cmdExtract(args: args)
         case .create: cmdCreate(args: args)
@@ -146,6 +176,19 @@ struct App {
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────
+
+/// Reports which 7za/7z binary the archiver resolved to. The app bundle ships
+/// its own copy, so this is the quickest way to tell an embedded engine from a
+/// system one when something misbehaves.
+func cmdTool() {
+    guard let cStr = archiver_find_tool() else {
+        printStderr("No archive engine found.")
+        printStderr("Install p7zip (brew install p7zip) or run from the app bundle.")
+        exit(1)
+    }
+    print(String(cString: cStr))
+    archiver_free_string(cStr)
+}
 
 func cmdList(args: Args) {
     guard let path = args.archive else { printStderr("error: no archive specified"); exit(1) }
@@ -159,7 +202,7 @@ func cmdList(args: Args) {
     guard let list = archiver_list(handle, path, args.password.isEmpty ? nil : args.password, &err)
     else { exit(1) }
     if let e = err {
-        printStderr("error: \(String(cString: e))")
+        printStderr("error: \(cleanMessage(String(cString: e)))")
         archiver_free_string(e)
         archiver_free_entries(list)
         exit(1)
@@ -170,17 +213,23 @@ func cmdList(args: Args) {
     print("Archive: \(URL(fileURLWithPath: path).lastPathComponent)")
     print("\(count) entr\(count == 1 ? "y" : "ies")")
     print(String(repeating: "-", count: 72))
-    let header = "Name".padding(toLength: 40, withPad: " ", startingAt: 0)
-    print("\(header)\(rightPad("Size", 12))\(rightPad("Compressed", 12))  Date")
+    print("\(leftPad("Name", 40))\(rightPad("Size", 12))\(rightPad("Compressed", 12))  Date")
     print(String(repeating: "-", count: 72))
     for i in 0..<count {
         let e = list.pointee.entries[i]
         let name = String(cString: e.name)
         let date = String(cString: e.date)
         let prefix = e.isFolder ? "[DIR] " : ""
-        let displayName = (prefix + name).padding(toLength: 40, withPad: " ", startingAt: 0)
-        print("\(displayName)\(rightPad(formatSize(e.size), 12))\(rightPad(formatSize(e.compressedSize), 12))  \(date)")
+        print("\(leftPad(prefix + name, 40))\(rightPad(formatSize(e.size), 12))\(rightPad(formatSize(e.compressedSize), 12))  \(date)")
     }
+}
+
+/// Pads to `len` for column alignment. Long names overflow rather than being
+/// truncated — a listing that hides part of a filename is worse than a ragged
+/// column.
+func leftPad(_ s: String, _ len: Int) -> String {
+    if s.count >= len { return s + " " }
+    return s + String(repeating: " ", count: len - s.count)
 }
 
 func rightPad(_ s: String, _ len: Int) -> String {
@@ -210,14 +259,12 @@ func cmdExtract(args: Args) {
     try? FileManager.default.createDirectory(atPath: dest, withIntermediateDirectories: true)
     print("Extracting to \(dest)...")
     var err: UnsafeMutablePointer<CChar>?
-    let cb: CProgressCallback = { pct, _ in
-        if pct % 10 == 0 || pct == 100 { printStderr("\rProgress: \(pct)%") }
-    }
-    let ok = archiver_extract(handle, path, dest, args.password.isEmpty ? nil : args.password, &err, cb, nil)
+    let ok = archiver_extract(handle, path, dest, args.password.isEmpty ? nil : args.password, &err, progressCallback, nil)
+    clearProgress()
     if ok {
-        print("\nDone!")
+        print("Done!")
     } else {
-        let msg = err.map { String(cString: $0) } ?? "extraction failed"
+        let msg = err.map { cleanMessage(String(cString: $0)) } ?? "extraction failed"
         err.map { archiver_free_string($0) }
         printStderr("error: \(msg)")
         exit(1)
@@ -243,14 +290,12 @@ func cmdCreate(args: Args) {
     let cfiles: [UnsafePointer<CChar>?] = cstrs.map { UnsafePointer($0) }
     print("Creating \(dest)...")
     var err: UnsafeMutablePointer<CChar>?
-    let cb: CProgressCallback = { pct, _ in
-        if pct % 10 == 0 || pct == 100 { printStderr("\rProgress: \(pct)%") }
-    }
-    let ok = archiver_create_archive(handle, cfiles, Int32(args.files.count), dest, args.format, Int32(args.level), args.password.isEmpty ? nil : args.password, &err, cb, nil)
+    let ok = archiver_create_archive(handle, cfiles, Int32(args.files.count), dest, args.format, Int32(args.level), args.password.isEmpty ? nil : args.password, &err, progressCallback, nil)
+    clearProgress()
     if ok {
-        print("\nDone!")
+        print("Done!")
     } else {
-        let msg = err.map { String(cString: $0) } ?? "creation failed"
+        let msg = err.map { cleanMessage(String(cString: $0)) } ?? "creation failed"
         err.map { archiver_free_string($0) }
         printStderr("error: \(msg)")
         exit(1)

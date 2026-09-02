@@ -5,6 +5,9 @@
 #include <QTemporaryDir>
 #include <QStandardPaths>
 #include <QRegularExpression>
+#include <QTimer>
+#include <QHash>
+#include <QFile>
 
 
 ArchiveService::ArchiveService(QObject *parent) : QObject(parent) {}
@@ -38,7 +41,12 @@ QString ArchiveService::formatSize(qint64 bytes)
 
 bool ArchiveService::isArchive(const QString &path)
 {
-    static const QStringList exts = {"7z","zip","rar","tar","gz","bz2","xz","tgz","tbz2","txz"};
+    static const QStringList exts = {
+        "7z","zip","rar","tar","gz","bz2","xz","tgz","tbz2","tbz","txz","taz",
+        "z","lzma","lz4","zst","iso","cab","arj","lzh","lha","wim","swm","esd",
+        "dmg","hfs","vhd","vhdx","vmdk","cpio","rpm","deb","chm","msi","udf",
+        "squashfs","apfs","qcow2","fat","ntfs","mbr","gpt","xar","pkg"
+    };
     QString ext = QFileInfo(path).suffix().toLower();
     if (ext == "gz" && path.endsWith(".tar.gz", Qt::CaseInsensitive)) return true;
     if (ext == "bz2" && path.endsWith(".tar.bz2", Qt::CaseInsensitive)) return true;
@@ -145,10 +153,60 @@ void ArchiveService::createArchive(const QStringList &files, const QString &dest
         emit errorOccurred("No archive tool available.");
         return;
     }
+    // tar.gz / tar.bz2 / tar.xz are not 7za format names: the tar has to be
+    // built first and then compressed. Stage one runs here, stage two is
+    // queued in m_pendingCompress and fired from handleCreate().
+    static const QHash<QString, QString> compound = {
+        {"tar.gz", "gzip"}, {"tar.bz2", "bzip2"}, {"tar.xz", "xz"}
+    };
+    m_compoundDir.reset();
+    m_pendingCompress.clear();
+    m_compoundStaged.clear();
+    m_compoundFinal.clear();
+
+    if (compound.contains(format)) {
+        m_compoundDir = std::make_unique<QTemporaryDir>();
+        if (!m_compoundDir->isValid()) {
+            emit errorOccurred("Cannot create temporary directory");
+            return;
+        }
+        // Name the tar after the final archive so that decompressing
+        // `photos.tar.gz` yields `photos.tar`, not a temp-file name.
+        QString base = QFileInfo(destination).fileName();
+        for (const QString &suffix : {".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".tbz", ".txz"}) {
+            if (base.endsWith(suffix, Qt::CaseInsensitive)) {
+                base.chop(suffix.size());
+                break;
+            }
+        }
+        if (base.isEmpty()) base = "archive";
+        if (!base.endsWith(".tar", Qt::CaseInsensitive)) base += ".tar";
+        const QString tarPath = m_compoundDir->filePath(base);
+
+        // gzip/bzip2/xz cannot be appended to, so an existing destination has
+        // to be replaced. Build the result beside it under a temporary name and
+        // rename it into place only once it is complete, so a failure here
+        // cannot destroy the archive that was already there.
+        m_compoundStaged = destination + ".7z-part";
+        m_compoundFinal = destination;
+        QFile::remove(m_compoundStaged);
+
+        m_pendingCompress = QStringList{"a", "-t" + compound.value(format), m_compoundStaged, tarPath,
+                                        "-mx=" + QString::number(compressionLevel), "-y"};
+        if (!password.isEmpty()) m_pendingCompress << "-p" + password;
+
+        QStringList tarArgs{"a", "-ttar", tarPath, "-y"};
+        for (const auto &f : files) tarArgs << f;
+        startProc(tool, tarArgs);
+        return;
+    }
+
     QStringList a{"a", "-t" + format, destination,
                   "-mx=" + QString::number(compressionLevel), "-y"};
-    if (!password.isEmpty())
-        a << "-p" + password << (format == "7z" ? "-mhe=on" : "");
+    if (!password.isEmpty()) {
+        a << "-p" + password;
+        if (format == "7z") a << "-mhe=on";
+    }
     // Files: if a single directory, use its path so 7za preserves structure
     for (const auto &f : files) a << f;
     startProc(tool, a);
@@ -179,6 +237,10 @@ void ArchiveService::onProcessFinished(int exitCode, QProcess::ExitStatus status
     }
 
     if (status != QProcess::NormalExit || exitCode != 0) {
+        m_pendingCompress.clear();
+        m_compoundDir.reset();
+        if (!m_compoundStaged.isEmpty()) { QFile::remove(m_compoundStaged); m_compoundStaged.clear(); }
+        m_compoundFinal.clear();
         QString err;
         if (m_proc) err = QString::fromUtf8(m_proc->readAllStandardError());
         if (err.isEmpty()) err = QString::fromUtf8(m_out).left(500);
@@ -189,7 +251,7 @@ void ArchiveService::onProcessFinished(int exitCode, QProcess::ExitStatus status
         return;
     }
 
-    emit progressChanged(100, "Done");
+    if (m_pendingCompress.isEmpty()) emit progressChanged(100, "Done");
     switch (m_op) {
     case List:    handleList(); break;
     case Extract: handleExtract(); break;
@@ -205,89 +267,46 @@ void ArchiveService::onProcessFinished(int exitCode, QProcess::ExitStatus status
 // ═══════════════════════════════════════════════════════════════════════════
 QVector<ArchiveEntry> ArchiveService::parse7zList(const QString &data)
 {
-    QVector<ArchiveEntry> entries;
-    for (const auto &line : data.split('\n', Qt::SkipEmptyParts)) {
-        QString trimmed = line.trimmed();
-        if (trimmed.isEmpty()) continue;
-        // Normalize tabs → spaces
-        QString s = trimmed;
-        s.replace('\t', ' ');
-        // Split on 2+ spaces: ["date time attr", size, compressed?, name]
-        QStringList parts = s.split(QRegularExpression(R"(\s{2,})"), Qt::SkipEmptyParts);
-        if (parts.isEmpty()) continue;
+    // `7za l -ba` emits fixed-width columns:
+    //
+    //   2026-09-02 12:16:42 D....            0            0  path/to/name
+    //   |0-9      |11-18    |20-24 |26-37        |39-50      |53+
+    //
+    // The packed column is blank for entries inside a solid block, and the
+    // name begins at column 53 — so it is read by offset rather than by
+    // splitting on whitespace, which would corrupt names containing runs of
+    // two or more spaces.
+    constexpr int kNameColumn = 53;
+    static const QRegularExpression datePrefix(R"(^\d{4}-\d{2}-\d{2} )");
+    static const QRegularExpression spaceRun(R"(\s+)");
 
-        // First part = "2026-05-28 22:03:46 ....A" → split by 1+ space
-        QStringList head = parts[0].split(QRegularExpression(R"(\s+)"), Qt::SkipEmptyParts);
+    QVector<ArchiveEntry> entries;
+    const QStringList lines = data.split('\n');
+    for (QString line : lines) {
+        while (line.endsWith('\r') || line.endsWith(' ')) line.chop(1);
+        if (line.isEmpty()) continue;
+        if (!datePrefix.match(line).hasMatch() || line.size() <= kNameColumn) continue;
 
         ArchiveEntry e;
-        if (head.size() >= 3) {
-            e.date = QDateTime::fromString(head[0] + " " + head[1], "yyyy-MM-dd HH:mm:ss");
-            if (!e.date.isValid())
-                e.date = QDateTime::fromString(head[0] + " " + head[1], "yyyy-MM-dd HH:mm");
-            e.isFolder = head[2].startsWith('D');
+        e.date = QDateTime::fromString(line.left(19), "yyyy-MM-dd HH:mm:ss");
+        e.isFolder = line.at(20) == 'D';
+
+        if (line.at(51) == ' ' && line.at(52) == ' ' && line.at(kNameColumn) != ' ') {
+            e.size = line.mid(26, 12).trimmed().toLongLong();
+            e.compressedSize = line.mid(39, 12).trimmed().toLongLong();
+            e.name = line.mid(kNameColumn);
+        } else {
+            // A size wider than its column shifts everything right; fall back
+            // to reading the attr/size/packed tokens in order.
+            const QStringList fields = line.mid(19).split(spaceRun, Qt::SkipEmptyParts);
+            if (fields.size() >= 2) e.size = fields.at(1).toLongLong();
+            if (fields.size() >= 3) e.compressedSize = fields.at(2).toLongLong();
+            e.name = fields.size() >= 4 ? fields.mid(3).join(' ') : QString();
         }
-        if (!e.date.isValid()) e.date = QDateTime::currentDateTime();
 
-        // Remaining parts: [size, (compressed?), name]
-        if (parts.size() == 2) {
-            // Only size and name
-            e.size = parts[1].toLongLong();
-        } else if (parts.size() >= 3) {
-            e.size = parts[1].toLongLong();
-            // If parts.size() == 3: [size, compressed, name]
-            // If parts.size() == 4: [size, compressed, name] with extra — use middle
-            int compressedIdx = (parts.size() == 3) ? 2 : (parts.size() - 1);
-            // Try compressed at parts[2], fall back to trying other positions
-            QString compressedVal = parts[2].trimmed();
-            bool ok = false;
-            e.compressedSize = compressedVal.toLongLong(&ok);
-            if (!ok) compressedVal.clear();
-            // Name = last part
-            e.name = parts.last().trimmed();
-        }
-        if (e.name.isEmpty()) e.name = parts.last().trimmed();
-        e.path = e.name;
-        if (!e.name.isEmpty())
-            entries.append(e);
-    }
-    return entries;
-}
-
-QVector<ArchiveEntry> ArchiveService::parseZipList(const QString &data)
-{
-    QVector<ArchiveEntry> entries;
-    bool ds = false;
-    for (const auto &line : data.split('\n')) {
-        if (line.contains("---")) { ds = true; continue; }
-        if (!ds || line.startsWith("------")) continue;
-        QStringList p = line.split(' ', Qt::SkipEmptyParts);
-        if (p.size() < 4) continue;
-        ArchiveEntry e;
-        e.size = p[0].toLongLong();
-        e.date = QDateTime::fromString(p[1] + " " + p[2], "yyyy-MM-dd HH:mm");
+        e.name = e.name.trimmed();
+        if (e.name.isEmpty()) continue;
         if (!e.date.isValid()) e.date = QDateTime::currentDateTime();
-        e.name = p.mid(3).join(' ');
-        e.isFolder = e.name.endsWith('/');
-        e.path = e.name;
-        entries.append(e);
-    }
-    return entries;
-}
-
-QVector<ArchiveEntry> ArchiveService::parseTarList(const QString &data)
-{
-    QVector<ArchiveEntry> entries;
-    for (const auto &line : data.split('\n', Qt::SkipEmptyParts)) {
-        QStringList p = line.split(' ', Qt::SkipEmptyParts);
-        if (p.size() < 5) continue;
-        ArchiveEntry e;
-        e.isFolder = p[0].startsWith('d') || p.last().endsWith('/');
-        e.size = p[2].toLongLong();
-        e.date = QDateTime::fromString(p[3] + " " + p[4], "MMM dd HH:mm yyyy");
-        if (!e.date.isValid())
-            e.date = QDateTime::fromString(p[3] + " " + p[4], "MMM  d HH:mm yyyy");
-        if (!e.date.isValid()) e.date = QDateTime::currentDateTime();
-        e.name = p.mid(5).join(' ');
         e.path = e.name;
         entries.append(e);
     }
@@ -306,6 +325,26 @@ void ArchiveService::handleExtract()
 
 void ArchiveService::handleCreate()
 {
+    if (!m_pendingCompress.isEmpty()) {
+        const QStringList args = m_pendingCompress;
+        m_pendingCompress.clear();
+        QTimer::singleShot(0, this, [this, args] { startProc(bundledTool(), args); });
+        return;
+    }
+    m_compoundDir.reset();
+
+    if (!m_compoundStaged.isEmpty()) {
+        const QString staged = m_compoundStaged;
+        const QString finalPath = m_compoundFinal;
+        m_compoundStaged.clear();
+        m_compoundFinal.clear();
+        QFile::remove(finalPath);
+        if (!QFile::rename(staged, finalPath)) {
+            QFile::remove(staged);
+            emit errorOccurred("Failed to write " + finalPath);
+            return;
+        }
+    }
     emit finished(true, "Archive created. (" + QString::number(m_timer.elapsed()/1000) + "s)");
 }
 

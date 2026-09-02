@@ -578,12 +578,12 @@ final class TUIApp {
         defer { cstrs.forEach { if let p = $0 { free(p) } } }
         let cfiles: [UnsafePointer<CChar>?] = cstrs.map { UnsafePointer($0) }
 
-        let ext = (path as NSString).pathExtension.lowercased()
-        let format = ext.isEmpty ? "zip" : ext
+        // An empty format lets the archiver derive it from the destination,
+        // which handles two-part extensions like .tar.gz correctly.
         var err: UnsafeMutablePointer<CChar>?
 
         let ok = archiver_create_archive(archiver, cfiles, Int32(files.count),
-                                         path, format, 5, nil, &err, nil, nil)
+                                         path, "", 5, nil, &err, nil, nil)
         if ok {
             statusMessage = "Archive created: \(path)"
             loadDirectory(currentDir)

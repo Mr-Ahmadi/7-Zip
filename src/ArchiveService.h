@@ -57,10 +57,15 @@ private:
     std::unique_ptr<QTemporaryDir> m_previewDir;
     QString m_previewEntryPath;
 
+    // Second stage of a compound (tar.gz/tar.bz2/tar.xz) creation, queued
+    // while the intermediate tar is still being written.
+    std::unique_ptr<QTemporaryDir> m_compoundDir;
+    QStringList m_pendingCompress;
+    QString m_compoundStaged;   // partial output, renamed into place on success
+    QString m_compoundFinal;
+
     void startProc(const QString &prog, const QStringList &args);
     QVector<ArchiveEntry> parse7zList(const QString &data);
-    QVector<ArchiveEntry> parseZipList(const QString &data);
-    QVector<ArchiveEntry> parseTarList(const QString &data);
     void handleList();
     void handleExtract();
     void handleCreate();
